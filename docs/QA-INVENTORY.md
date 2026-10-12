@@ -14,4 +14,4 @@
 - Keyboard focus, labels, touch targets, reduced motion, overflow and contrast.
 - No broad hosts, telemetry, remote scripts or unsafe HTML.
 
-Evidence: engine unit tests plus a controlled browser fixture with changing #stock and #noise, screenshots and browser console errors. Automated browser checks run the actual MV3 extension in a disposable Helium profile. Personal-profile installation is a separate manual Load unpacked step and is not yet verified.
+Evidence: engine unit tests plus a controlled browser fixture with changing #stock and #noise, screenshots and browser console errors. Automated browser checks run the actual MV3 extension in a disposable Helium profile. The production build was also loaded through Helium's Load unpacked interface in the user's personal profile; its enabled card and pinned action were verified.
