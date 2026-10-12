@@ -4,7 +4,7 @@ This is the operational checklist for publishing The Best Auto Refresh App to
 the Chrome Web Store. It splits the work into what this repository automates and
 what only the account owner can do in a browser.
 
-Current release: **1.3.0**. Store review and acceptance are decided by Google;
+Current release: **1.3.1**. Store review and acceptance are decided by Google;
 nothing here guarantees approval.
 
 ## What is automated vs. manual
@@ -52,7 +52,7 @@ node scripts/publish-cws.mjs upload --dry-run
 ## Step 3 — Create the item (first submission only)
 
 1. In the developer dashboard choose **Add new item**.
-2. Upload `dist/the-best-auto-refresh-app-1.3.0.zip`.
+2. Upload `dist/the-best-auto-refresh-app-1.3.1.zip`.
 3. Note the **extension ID** and the **publisher ID** shown in the dashboard.
    Both are needed later for automation.
 
@@ -129,7 +129,8 @@ common review rejection.
   and a per-host grant; that custom JavaScript additionally needs the optional
   `userScripts` permission *and* Chrome's Allow User Scripts setting (Chrome
   138+); and how to revoke those grants from the dashboard. Mention that
-  `minimum_chrome_version` is 135.
+  `minimum_chrome_version` is 106 for refreshing and monitoring; custom scripts
+  require Chrome 135 or newer.
 
 Then choose **Submit for review**.
 

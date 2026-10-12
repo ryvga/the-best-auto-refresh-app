@@ -10,6 +10,11 @@ assert.equal(manifest.host_permissions?.length || 0, 0);
 assert.deepEqual(manifest.optional_permissions, ['userScripts']);
 assert.deepEqual(manifest.optional_host_permissions, ['https://*/*', 'http://localhost/*', 'http://127.0.0.1/*']);
 assert.equal(manifest.background.type, 'module');
+// The minimum is functional, not cosmetic: `record.documentId` comes from
+// InjectionResult.documentId (Chrome 106+), and isCurrentDocument() gates every
+// refresh cycle on it. Lowering this ships an extension that never refreshes.
+assert.ok(Number(manifest.minimum_chrome_version) >= 106,
+  `minimum_chrome_version must be at least 106, got ${manifest.minimum_chrome_version}`);
 assert.ok(!manifest.content_security_policy?.extension_pages?.includes('https:'));
 const paths = [manifest.background.service_worker, manifest.action.default_popup, manifest.options_page || manifest.options_ui?.page, ...Object.values(manifest.icons), ...Object.values(manifest.action.default_icon || {})];
 for (const path of paths.filter(Boolean)) await access(new URL(path, root));

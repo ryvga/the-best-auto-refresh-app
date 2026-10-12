@@ -1,5 +1,28 @@
 # Validation
 
+## Version 1.3.1 — supported Chrome range
+
+The manifest previously declared `minimum_chrome_version` 135, which excluded every
+Chromium browser older than that even though only the optional custom-script feature
+needs it. The floor is now 106, which is the real requirement for refreshing:
+
+- `InjectionResult.documentId` is Chrome 106+. `record.documentId` is read from it in
+  `captureDocument`, and `isCurrentDocument()` gates every refresh cycle on that value.
+  Below 106 the extension installs but never refreshes, so 106 is a functional floor
+  rather than a preference.
+- `chrome.storage.session` and `storage.session.setAccessLevel` are Chrome 102+.
+- `chrome.scripting.executeScript` is Chrome 88+ and `InjectionResult.frameId` is
+  Chrome 90+; the extension targets `frameIds`, not `documentIds`.
+- `chrome.userScripts.execute()` is Chrome 135+. It stays optional and off by default.
+  `resolveUserScriptAccess` already requires `typeof api.execute === 'function'`, and
+  `runScript` returns `unsupported` before calling `configureWorld`, so Chrome 120–134
+  (where the `userScripts` namespace exists without `execute`) reports the limitation
+  instead of throwing.
+
+Only Helium 141 has been exercised in a real browser. Versions 106–140 are supported by
+documented API requirements, not by browser runs; verify that range before relying on
+it. `scripts/validate-manifest.mjs` now fails if the declared minimum drops below 106.
+
 ## Version 1.3.0 — independent tabs and notification setup
 
 Validated with Node.js 25 and Helium 141 in fresh disposable profiles. Required and optional permissions are unchanged. No external webhook, payment, advertising injection or Store submission occurred.

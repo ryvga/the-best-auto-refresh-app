@@ -40,7 +40,7 @@ Monitoring requires an open tab and running browser. Background tabs, browser su
 
 ## Privacy and permissions
 
-See [Privacy policy](docs/PRIVACY.md). Required permissions are `activeTab`, `scripting`, `storage`, and `alarms`. JavaScript and host access for automation are optional, requested only from explicit Connect/Enable buttons. No host access is required for normal refreshing. There are no tracking libraries or developer monitoring services. Chrome/Chromium 135 or newer is required; custom scripts also need Chrome's Allow User Scripts setting.
+See [Privacy policy](docs/PRIVACY.md). Required permissions are `activeTab`, `scripting`, `storage`, and `alarms`. JavaScript and host access for automation are optional, requested only from explicit Connect/Enable buttons. No host access is required for normal refreshing. There are no tracking libraries or developer monitoring services. Chrome/Chromium 106 or newer is required for refreshing and monitoring, which covers current Chromium-based browsers; custom scripts additionally need Chrome 135 or newer and Chrome's Allow User Scripts setting.
 
 ## Development
 
