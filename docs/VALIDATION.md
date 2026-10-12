@@ -12,7 +12,7 @@ The production package contains only extension assets. Syntax, manifest/assets a
 
 Workers: two bailian-tpp DeepSeek V4.1 Flash runs delivered UI/ntfy and engine/webhook changes. The orchestrator stopped their extended runs after code delivery (exit 1), reviewed and integrated the changes. Native GPT-6 Luna supplied additional unit tests and read-only review. Native GPT-6.1 Sol independently reviewed security and found the manual-profile draft race and interaction-listener timing gap; both were repaired and covered by browser regressions. A bailian-tpp Qwen3.8 Max review attempt delivered no result and was stopped; it is not counted as completed review.
 
-See [product and funding research](RESEARCH.md) for the competitor comparison and support-link decision. Every feature remains free; no ads were added.
+Every feature remains free; no ads were added.
 
 ## Version 1.2.0 — event automation
 
