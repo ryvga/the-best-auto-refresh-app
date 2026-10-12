@@ -50,9 +50,25 @@ const ITEM_STATES = new Set([
   'CANCELLED',
 ]);
 
+class CliError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'CliError';
+  }
+}
+
+/**
+ * Report a fatal problem and stop the command.
+ *
+ * This sets `process.exitCode` and throws instead of calling `process.exit()`.
+ * Exiting while an undici connection is still closing crashes Node with a libuv
+ * assertion ("!(handle->flags & UV_HANDLE_CLOSING)") on the network path, which
+ * is exactly where publish failures happen, so the process is allowed to drain.
+ */
 function fail(message) {
   process.stderr.write(`error: ${message}\n`);
-  process.exit(1);
+  process.exitCode = 1;
+  throw new CliError(message);
 }
 
 function parseArgs(argv) {
@@ -330,5 +346,7 @@ async function main() {
 }
 
 main().catch((error) => {
-  fail(error?.stack || String(error));
+  if (error instanceof CliError) return; // already reported by fail()
+  process.stderr.write(`error: ${error?.stack || String(error)}\n`);
+  process.exitCode = 1;
 });

@@ -61,6 +61,19 @@ const consentUrl =
     state,
   });
 
+/**
+ * Shut down cleanly after answering the browser.
+ *
+ * `process.exit()` while an undici connection is closing crashes Node with a
+ * libuv assertion, and a lingering keep-alive socket would hold the event loop
+ * open, so pending connections are closed and the exit code is set instead.
+ */
+function finish(code) {
+  process.exitCode = code;
+  if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+  server.close();
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, redirectUri);
   if (url.pathname !== '/') {
@@ -71,15 +84,15 @@ const server = http.createServer(async (req, res) => {
   const code = url.searchParams.get('code');
   if (error) {
     res.writeHead(400, { 'Content-Type': 'text/plain' }).end(`Authorization failed: ${error}`);
-    server.close();
     process.stderr.write(`error: authorization failed: ${error}\n`);
-    process.exit(1);
+    finish(1);
+    return;
   }
   if (url.searchParams.get('state') !== state) {
     res.writeHead(400, { 'Content-Type': 'text/plain' }).end('State mismatch.');
-    server.close();
     process.stderr.write('error: state mismatch; the response did not match this request\n');
-    process.exit(1);
+    finish(1);
+    return;
   }
   if (!code) {
     res.writeHead(400, { 'Content-Type': 'text/plain' }).end('Missing authorization code.');
@@ -106,20 +119,18 @@ const server = http.createServer(async (req, res) => {
       if (response.ok && !payload.refresh_token) {
         process.stderr.write('Revoke the app\'s access in your Google account and retry so a refresh token is issued.\n');
       }
-      server.close();
-      process.exit(1);
+      finish(1);
+      return;
     }
     res.writeHead(200, { 'Content-Type': 'text/plain' }).end('Authorization complete. You can close this tab.');
     process.stdout.write('\nAuthorization complete.\n\n');
     process.stdout.write('Set this as the CWS_REFRESH_TOKEN secret (store it privately):\n\n');
     process.stdout.write(`${payload.refresh_token}\n\n`);
-    server.close();
-    process.exit(0);
+    finish(0);
   } catch (err) {
     res.writeHead(500, { 'Content-Type': 'text/plain' }).end('Token exchange failed.');
     process.stderr.write(`error: ${err.message}\n`);
-    server.close();
-    process.exit(1);
+    finish(1);
   }
 });
 
