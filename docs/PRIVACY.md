@@ -33,6 +33,15 @@ The ntfy helper only fills webhook fields locally. Connect only requests hostnam
 
 Support development links open the owner's public Ko-fi page only when clicked. The extension embeds no Ko-fi code or payment SDK and sends no monitoring data to Ko-fi. The external website and payment processor apply their own privacy policies. Donations are voluntary and all extension features remain free.
 
+## Limited use
+
+Handling of user data is limited to the extension's single purpose, refreshing the pages you choose and deciding when to stop. It complies with the Chrome Web Store User Data Policy, including the Limited Use requirements:
+
+- **Allowed use.** Data is used only to keep the tab you are monitoring refreshed and to evaluate the stop condition you chose. It is never used for advertising, profiling, or any purpose unrelated to that feature.
+- **Allowed transfer.** No user data is transferred to the developer or to any third party. The only outbound data is what you explicitly configure: your browser's own requests to the page being refreshed, and an optional webhook to an endpoint you supply.
+- **No advertising.** Data is never used or transferred to serve personalised, re-targeted, or interest-based advertisements.
+- **No human interaction.** No person, including the developer, can read your data. The developer receives none of it, so there is nothing to read. Support is answered only with what you choose to paste into a public issue.
+
 ## Control and contact
 
 Pause or stop a monitor from the popup or dashboard. Uninstalling the extension removes its browser-managed local storage. For privacy questions, open an issue in this repository. Do not include sensitive page contents or private URLs in public issues.
