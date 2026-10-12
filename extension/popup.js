@@ -23,6 +23,8 @@ import {
   permissionOriginForUrl
 } from './actions-core.js';
 
+import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
+
 'use strict';
 
 (() => {
@@ -93,6 +95,9 @@ import {
     preserveScroll: true,
     bypassCache: false,
     pauseWhenHidden: false,
+    // Off by default. The engine pauses the run on a trusted click or keystroke
+    // in the page and waits for an explicit Resume; the popup only carries it.
+    pauseOnInteraction: false,
     ignoreSelector: '',
     actions: DEFAULT_ACTIONS
   });
@@ -136,6 +141,11 @@ import {
     'automation-webhook-events',
     'automation-webhook-headers',
     'automation-webhook-body',
+    // The ntfy quick-setup pair reports its own inline errors; these ids have a
+    // matching #err-<id> node and never block Start, because they are only a
+    // generator for the webhook fields above.
+    'ntfy-server',
+    'ntfy-topic',
     'automation-script-code',
     'automation-script-events',
     'automation'
@@ -148,14 +158,19 @@ import {
   // when the browser closes. Values are kept exactly as typed: raw strings,
   // radio choices, checkbox states, the Advanced disclosure state, and the raw
   // automation fields (invalid JSON included) with their event selections.
-  const DRAFT_VERSION = 2;
+  const DRAFT_VERSION = 3;
   const DRAFT_KEY_PREFIX = 'popupDraft:';
   const DRAFT_TEXT_FIELDS = [
     'interval-seconds', 'min-seconds', 'max-seconds', 'settle-seconds',
-    'max-refreshes', 'max-minutes', 'keyword', 'selector', 'ignore-selector'
+    'max-refreshes', 'max-minutes', 'keyword', 'selector', 'ignore-selector',
+    // Raw ntfy quick-setup text: a half-typed topic or server comes back exactly
+    // as it was left, invalid characters included. These are draft-only fields;
+    // they are never part of the stored settings schema.
+    'ntfy-server', 'ntfy-topic'
   ];
   const DRAFT_CHECK_FIELDS = [
-    'case-sensitive', 'whole-word', 'preserve-scroll', 'bypass-cache', 'pause-when-hidden'
+    'case-sensitive', 'whole-word', 'preserve-scroll', 'bypass-cache', 'pause-when-hidden',
+    'pause-on-interaction'
   ];
   const DRAFT_PRESET_SET = new Set(PRESET_VALUES.concat('custom'));
   const DRAFT_MODE_SET = new Set(['fixed', 'random']);
@@ -222,7 +237,7 @@ import {
     'keyword-panel', 'keyword', 'selector-panel', 'selector', 'pick-element',
     'advanced', 'settle-seconds', 'max-refreshes', 'max-minutes',
     'ignore-selector', 'case-sensitive', 'whole-word', 'preserve-scroll',
-    'bypass-cache', 'pause-when-hidden', 'form-alert', 'primary-action',
+    'bypass-cache', 'pause-when-hidden', 'pause-on-interaction', 'form-alert', 'primary-action',
     'stop-action', 'footer-note', 'save-default', 'stop-all',
     'link-dashboard', 'link-help',
     'profile-card', 'profile-select-field', 'profile-select', 'profile-hint',
@@ -234,6 +249,8 @@ import {
     'automation-webhook-fields', 'automation-webhook-url', 'automation-webhook-method',
     'automation-webhook-connect', 'automation-webhook-connection', 'automation-webhook-events',
     'automation-webhook-headers', 'automation-webhook-body', 'automation-webhook-details',
+    'automation-webhook-test', 'automation-webhook-test-status',
+    'ntfy-setup', 'ntfy-status', 'ntfy-server', 'ntfy-topic', 'ntfy-use', 'ntfy-note',
     'automation-script', 'automation-script-enabled', 'automation-script-status',
     'automation-script-fields', 'automation-script-code', 'automation-script-count',
     'automation-script-example', 'automation-script-enable', 'automation-script-permission',
@@ -259,6 +276,7 @@ import {
   // formDirty records real user input so a late draft/default render can never
   // clobber it; draftWriteChain tracks dispatched writes before a draft is cleared.
   let formDirty = false;
+  let formRevision = 0;
   let restoringForm = false;
   let draftWriteChain = Promise.resolve();
   // Saved profiles and the honest "which profile is loaded" line. currentProfile
@@ -374,6 +392,7 @@ import {
       preserveScroll: source.preserveScroll !== false,
       bypassCache: source.bypassCache === true,
       pauseWhenHidden: source.pauseWhenHidden === true,
+      pauseOnInteraction: source.pauseOnInteraction === true,
       ignoreSelector: typeof source.ignoreSelector === 'string' ? source.ignoreSelector : '',
       // The shared schema normaliser keeps automation on every round trip:
       // defaults, drafts, profiles and the engine's own state.
@@ -678,14 +697,17 @@ import {
     if (!profile || (!opts.manual && formDirty)) return false;
     restoringForm = true;
     try {
-      applyConfigToForm(profile.config);
+      applyConfigToForm(opts.manual ? profile.config : automaticConfig(profile.config));
     } finally {
       restoringForm = false;
     }
 
     clearMatchedHint();
     currentProfile = profile;
-    if (opts.manual) formDirty = true;
+    if (opts.manual) {
+      formDirty = true;
+      formRevision += 1;
+    }
 
     const select = ui['profile-select'];
     if (select && !select.disabled) {
@@ -1032,12 +1054,15 @@ import {
 
     syncConditionalPanels();
     syncAutomationPanels();
+    // ntfy draft text lives outside the config schema, so its compact status is
+    // refreshed here as well as on every keystroke.
+    refreshNtfyIndicator();
     return true;
   }
 
   /**
    * Writes the whole form for the active tab immediately. Defaults are never
-   * touched here; only Start and Save as default change saved defaults.
+   * touched here; only the explicit Save as default action changes them.
    */
   function persistDraft() {
     if (!activeTab || typeof activeTab.id !== 'number') return Promise.resolve(false);
@@ -1053,11 +1078,37 @@ import {
     return write;
   }
 
+  // Shared defaults and automatic profile suggestions never arm automation.
+  // A per-tab draft/config or an explicit profile selection is the user's choice.
+  function automaticConfig(raw) {
+    const config = normalizeConfig(raw);
+    config.actions.webhook.enabled = false;
+    config.actions.script.enabled = false;
+    return config;
+  }
+
+  function tabSettingsKey(tabId) { return `popupSettings:${tabId}`; }
+
+  async function restoreTabSettings() {
+    if (!activeTab || !Number.isInteger(activeTab.id) || formDirty) return false;
+    const key = tabSettingsKey(activeTab.id);
+    const stored = await sessionGet([key]);
+    let config = stored[key];
+    if (!config) {
+      const response = unwrap(await sendMessage({ type: 'GET_STATE', tabId: activeTab.id }));
+      config = response.ok && response.state && response.state.config;
+    }
+    if (!config || formDirty) return false;
+    applyConfigToForm(config);
+    return true;
+  }
+
   /** Drops this tab's draft after a successful Start or Save as default. */
-  async function clearDraft() {
+  async function clearDraft(expectedRevision = formRevision) {
     if (!activeTab || typeof activeTab.id !== 'number') return Promise.resolve(false);
     const key = draftKey(activeTab.id);
     await draftWriteChain;
+    if (formRevision !== expectedRevision) return false;
     return sessionRemove([key]);
   }
 
@@ -1084,6 +1135,7 @@ import {
   function handleFormEdit() {
     formDirty = true;
     if (restoringForm) return;
+    formRevision += 1;
     // Real typing means the form is no longer exactly the matched profile.
     clearMatchedHint();
     persistDraft();
@@ -1191,8 +1243,17 @@ import {
   function hasPendingSettings() {
     if (!['running', 'paused'].includes(currentState.status)) return false;
     const { config, errors } = collectForm();
-    return errors.length === 0
-      && JSON.stringify(config) !== JSON.stringify(normalizeConfig(currentState.config));
+    if (errors.length) return false;
+    const engineConfig = normalizeConfig(currentState.config);
+    // A worker build that predates pauseOnInteraction cannot report it back, so
+    // comparing it would leave a permanent "Apply & restart" for a setting that
+    // build cannot store. The key is dropped from both sides, and only then.
+    if (currentState.config && typeof currentState.config === 'object'
+      && !('pauseOnInteraction' in currentState.config)) {
+      delete config.pauseOnInteraction;
+      delete engineConfig.pauseOnInteraction;
+    }
+    return JSON.stringify(config) !== JSON.stringify(engineConfig);
   }
 
   function renderActions(status) {
@@ -1499,6 +1560,7 @@ import {
       preserveScroll: ui['preserve-scroll'].checked,
       bypassCache: ui['bypass-cache'].checked,
       pauseWhenHidden: ui['pause-when-hidden'].checked,
+      pauseOnInteraction: ui['pause-on-interaction'].checked,
       ignoreSelector,
       actions: validated.ok === true && validated.actions ? validated.actions : rawActions
     });
@@ -1529,6 +1591,7 @@ import {
     ui['preserve-scroll'].checked = config.preserveScroll;
     ui['bypass-cache'].checked = config.bypassCache;
     ui['pause-when-hidden'].checked = config.pauseWhenHidden;
+    ui['pause-on-interaction'].checked = config.pauseOnInteraction;
     ui['ignore-selector'].value = config.ignoreSelector;
 
     applyActionsToForm(config.actions);
@@ -1890,6 +1953,13 @@ import {
 
   const SCRIPT_SWITCH_HELP = 'Chrome 138 and later also needs “Allow User Scripts” switched on by hand in chrome://extensions → this extension → Details; that security switch cannot be opened for you.';
 
+  /**
+   * Kept beside the exact browser error rather than replacing it. An optional
+   * hostname that a freshly updated build declares is only visible to Chrome
+   * after that build is reloaded, so the honest next step is stated plainly.
+   */
+  const PERMISSION_RELOAD_HELP = 'If the extension was updated or reloaded after this page opened, open chrome://extensions, press Reload on The Best Auto Refresh App, reopen this popup and try again — a new optional hostname cannot be granted until the extension is reloaded.';
+
   function refreshScriptIndicator() {
     const status = ui['automation-script-status'];
     const line = ui['automation-script-permission'];
@@ -1976,7 +2046,10 @@ import {
         const failed = chrome.runtime && chrome.runtime.lastError;
         if (failed) {
           setPill(status, 'error', 'Failed');
-          setStatusLine(line, failed.message || 'The permission request failed.', 'is-error');
+          // The browser's own words come first and are never summarised away;
+          // the reload step is appended because a stale build cannot be granted
+          // a newly declared optional hostname.
+          setStatusLine(line, `${failed.message || 'The permission request failed.'} ${PERMISSION_RELOAD_HELP}`, 'is-error');
           return;
         }
         if (granted !== true) {
@@ -1989,8 +2062,155 @@ import {
       });
     } catch (error) {
       setPill(status, 'error', 'Failed');
-      setStatusLine(line, (error && error.message) || 'The permission request could not be started.', 'is-error');
+      setStatusLine(line, `${(error && error.message) || 'The permission request could not be started.'} ${PERMISSION_RELOAD_HELP}`, 'is-error');
     }
+  }
+
+  // ------------------------------------------------------ ntfy quick setup
+  //
+  // ntfy is a convenience generator, not a second kind of automation. The two
+  // text fields below are tab drafts only: pressing the button writes the plain
+  // webhook fields (URL, method, headers, body, events, details) and nothing
+  // else. The button never enables the webhook, never requests a permission and
+  // never sends a request. The only code that sends anything is the explicit
+  // "Send test notification" button further down.
+
+  function setNtfyNote(text, variant) {
+    setStatusLine(ui['ntfy-note'], text, variant);
+  }
+
+  function ntfyInput() {
+    return {
+      server: ui['ntfy-server'] ? ui['ntfy-server'].value : '',
+      topic: ui['ntfy-topic'] ? ui['ntfy-topic'].value : ''
+    };
+  }
+
+  /** Local, pure check of both boxes; used only for the compact status pill. */
+  function refreshNtfyIndicator() {
+    const { server, topic } = ntfyInput();
+    const serverTrim = server.trim();
+    const topicTrim = topic.trim();
+    if (topicTrim === '') {
+      // A topic is the one thing ntfy genuinely requires, and the server box
+      // starts pre-filled, so an untouched pair reads as "not set" rather than
+      // as an error the user did not make.
+      const untouched = serverTrim === '' || serverTrim.replace(/\/+$/, '') === NTFY_DEFAULT_SERVER;
+      setPill(ui['ntfy-status'], 'unavailable', untouched ? 'Not set' : 'Needs topic');
+      return;
+    }
+    const described = describeNtfySetup({ server, topic });
+    if (described.ok) {
+      setPill(ui['ntfy-status'], 'ready', 'Ready');
+      return;
+    }
+    const serverBad = described.errors.some((item) => item.field === 'ntfy-server');
+    setPill(ui['ntfy-status'], 'error', serverBad ? 'Check server' : 'Check topic');
+  }
+
+  /** Explicit button: fill the webhook fields from the ntfy pair. */
+  function applyNtfySettings() {
+    clearFieldError('ntfy-server');
+    clearFieldError('ntfy-topic');
+    setNtfyNote('', '');
+
+    const described = describeNtfySetup(ntfyInput());
+    if (!described.ok) {
+      described.errors.forEach((item) => setFieldError(item.field, item.message));
+      const first = described.errors[0];
+      setNtfyNote(first.message, 'is-error');
+      const target = first.field === 'ntfy-topic' ? ui['ntfy-topic'] : ui['ntfy-server'];
+      if (target && typeof target.focus === 'function') target.focus();
+      return;
+    }
+
+    const patch = described.webhook;
+    ui['automation-webhook-url'].value = patch.url;
+    ui['automation-webhook-method'].value = patch.method;
+    ui['automation-webhook-headers'].value = patch.headers;
+    ui['automation-webhook-body'].value = patch.body;
+    setSelectedEvents('webhook', patch.events);
+    setCheck(ui['automation-webhook-details'], patch.includePageDetails === true);
+    // The fields that were just replaced are known-good, so any older complaint
+    // about them is cleared rather than left on screen.
+    ['automation-webhook-url', 'automation-webhook-events', 'automation-webhook-headers', 'automation-webhook-body']
+      .forEach(clearFieldError);
+    // A Start that failed on the old body or headers must not keep its alert on
+    // screen now that those fields were replaced with known-good values.
+    if (!hasVisibleFieldError()) {
+      ui['form-alert'].hidden = true;
+      ui['form-alert'].textContent = '';
+    }
+    if (ui['automation-webhook-enabled'] && !ui['automation-webhook-enabled'].checked) {
+      // The block is only visible when the webhook is on, so this can only
+      // happen through a scripted click: say so instead of silently enabling it.
+      setNtfyNote('The webhook switch is off, so these settings are saved but nothing will be sent until you switch it on.', '');
+    } else {
+      setNtfyNote(`Settings ready for “${described.topic}”. Connect the webhook, then send a test or start watching.`, 'is-success');
+    }
+    syncAutomationPanels();
+    scheduleAutomationStatus();
+    // A button press is real input: it marks the form dirty and writes the raw
+    // ntfy fields plus the new webhook values into this tab's draft.
+    handleFormEdit();
+    setFooterNote('ntfy settings written to the webhook fields. Nothing has been sent.');
+  }
+
+  // ------------------------------------------------- one explicit test request
+
+  function setTestBusy(next) {
+    if (ui['automation-webhook-test']) ui['automation-webhook-test'].disabled = next === true;
+  }
+
+  /**
+   * The only place in the popup that asks for a real request to be sent, and it
+   * runs from an explicit click alone. The engine returns
+   * `{ ok:true, message, status }` or `{ ok:false, error }`; this button never
+   * starts, pauses or stops a monitor, and it never runs page code.
+   */
+  async function sendTestNotification() {
+    const line = ui['automation-webhook-test-status'];
+    if (!env.live) {
+      setStatusLine(line, 'Preview only — the extension engine is not reachable here, so nothing can be sent.', 'is-error');
+      return;
+    }
+    if (!activeTab || typeof activeTab.id !== 'number') {
+      setStatusLine(line, 'No active tab is available for a test request.', 'is-error');
+      return;
+    }
+
+    // Raw values exactly as typed; the engine validates and trims them. The
+    // popup never sends this message anywhere except the extension worker.
+    const webhook = readActionsRawFromForm().webhook;
+    setTestBusy(true);
+    setStatusLine(line, 'Sending one test request…', '');
+    let response = null;
+    try {
+      response = await sendMessage({ type: 'TEST_WEBHOOK', tabId: activeTab.id, webhook });
+    } catch {
+      response = { ok: false, error: 'The extension could not complete the test. Reopen the popup and try again.' };
+    } finally {
+      setTestBusy(false);
+    }
+
+    if (response && response.ok === true) {
+      const message = typeof response.message === 'string' && response.message
+        ? response.message
+        : 'The test request was sent.';
+      // The worker already names the HTTP status in its message; the number is
+      // only appended when the message does not mention it, never twice.
+      const status = Number.isFinite(response.status) && !message.includes(String(response.status))
+        ? ` (HTTP ${response.status})`
+        : '';
+      setStatusLine(line, `${message}${status}`, 'is-success');
+      return;
+    }
+    // The engine's own wording is shown as-is, including a refused host or a
+    // malformed body, so the reason is never hidden.
+    const error = response && typeof response.error === 'string' && response.error
+      ? response.error
+      : 'The test request could not be sent, and the background worker did not say why.';
+    setStatusLine(line, error, 'is-error');
   }
 
   function enableScriptOnSite() {
@@ -2325,6 +2545,7 @@ import {
     }
 
     lastKnownConfig = config;
+    const submittedRevision = formRevision;
     setBusy(true);
     const result = unwrap(await sendMessage({ type: 'START', tabId: activeTab.id, config }));
     setBusy(false);
@@ -2334,9 +2555,9 @@ import {
       return;
     }
     applyState(result.state || Object.assign(idleState(), { status: 'running', config, startedAt: Date.now() }));
-    const saved = await storageSet({ defaults: config });
-    await clearDraft();
-    setFooterNote(saved ? 'Refreshing and saved as your default settings.' : 'Refreshing. Defaults could not be saved.');
+    const saved = await sessionSet({ [tabSettingsKey(activeTab.id)]: config });
+    await clearDraft(submittedRevision);
+    setFooterNote(saved ? 'Refreshing this tab. Use a saved profile to reuse these settings.' : 'Refreshing this tab. Its settings could not be remembered.');
   }
 
   async function stopAllTabs() {
@@ -2371,8 +2592,12 @@ import {
       previewMessage();
       return;
     }
+    const submittedRevision = formRevision;
     const saved = await storageSet({ defaults: config });
-    if (saved) await clearDraft();
+    if (saved) {
+      if (activeTab && Number.isInteger(activeTab.id)) await sessionSet({ [tabSettingsKey(activeTab.id)]: config });
+      await clearDraft(submittedRevision);
+    }
     setFooterNote(saved ? 'Saved as your default settings.' : 'Defaults could not be saved.');
   }
 
@@ -2547,6 +2772,16 @@ import {
     ui['automation-webhook-method'].addEventListener('change', scheduleAutomationUrlStatus);
     ui['automation-webhook-details'].addEventListener('change', scheduleAutomationUrlStatus);
     ui['automation-webhook-connect'].addEventListener('click', connectWebhook);
+
+    // ---- ntfy quick setup and the one explicit test request ----
+    // These handlers never call chrome.permissions.request and never fetch
+    // anything themselves; the test button hands a message to the worker.
+    if (ui['ntfy-use']) ui['ntfy-use'].addEventListener('click', applyNtfySettings);
+    if (ui['ntfy-server']) ui['ntfy-server'].addEventListener('input', refreshNtfyIndicator);
+    if (ui['ntfy-topic']) ui['ntfy-topic'].addEventListener('input', refreshNtfyIndicator);
+    if (ui['automation-webhook-test']) {
+      ui['automation-webhook-test'].addEventListener('click', sendTestNotification);
+    }
     ui['automation-script-enable'].addEventListener('click', enableScriptOnSite);
     ui['automation-script-example'].addEventListener('click', insertExampleSnippet);
     ui['automation-script-code'].addEventListener('input', updateCodeCount);
@@ -2655,6 +2890,7 @@ import {
     wireEvents();
     syncConditionalPanels();
     syncAutomationPanels();
+    refreshNtfyIndicator();
 
     if (!env.live) {
       ui['preview-banner'].hidden = false;
@@ -2665,10 +2901,14 @@ import {
       ui['automation-webhook-connect'].title = 'Preview only — the extension engine is not reachable.';
       ui['automation-script-enable'].disabled = true;
       ui['automation-script-enable'].title = 'Preview only — the extension engine is not reachable.';
+      // "Use ntfy settings" keeps working in preview because it only fills
+      // fields; the one button that asks for a real request cannot work here.
+      ui['automation-webhook-test'].disabled = true;
+      ui['automation-webhook-test'].title = 'Preview only — a test request needs the extension engine.';
     }
 
     const stored = await storageGet(['defaults']);
-    lastKnownConfig = normalizeConfig(stored.defaults);
+    lastKnownConfig = automaticConfig(stored.defaults);
     // If the user already typed while storage was loading, their input wins.
     if (!formDirty) applyConfigToForm(lastKnownConfig);
 
@@ -2696,6 +2936,7 @@ import {
       let restored = false;
       if (formDirty) await persistDraft();
       else restored = await restoreDraft();
+      if (!restored && !formDirty) restored = await restoreTabSettings();
       await refreshProfiles();
       // Auto-matching only happens on a first open with no draft: an unfinished
       // draft overrides every saved profile, and a match never starts refreshing.

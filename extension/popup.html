@@ -276,7 +276,15 @@
               <input type="checkbox" id="pause-when-hidden">
               <span>Pause while this tab is in the background</span>
             </label>
+            <label class="check" for="pause-on-interaction">
+              <input type="checkbox" id="pause-on-interaction" aria-describedby="hint-pause-on-interaction">
+              <span>Pause when I interact with the page</span>
+            </label>
           </div>
+          <p class="hint" id="hint-pause-on-interaction">
+            Off by default. While refreshing, a trusted click or keystroke on the page pauses the monitor so the page
+            is not reloaded under your hands. Nothing else changes, and refreshing stays paused until you press Resume.
+          </p>
         </fieldset>
 
       </div>
@@ -320,12 +328,52 @@
               <p class="field-error" id="err-automation-webhook-url" role="alert" hidden></p>
             </div>
 
+            <div class="ntfy-setup" id="ntfy-setup">
+              <div class="ntfy-head">
+                <span class="ntfy-title">ntfy quick setup</span>
+                <span class="pill" id="ntfy-status" data-status="off">Not set</span>
+              </div>
+              <p class="hint" id="hint-ntfy">
+                Get phone or desktop alerts through ntfy. Enter a server and topic, then choose
+                <strong>Use ntfy settings</strong>.
+              </p>
+
+              <div class="field-row">
+                <div class="field">
+                  <label class="field-label" for="ntfy-server">ntfy server</label>
+                  <input class="input" type="url" id="ntfy-server" inputmode="url" autocomplete="off" spellcheck="false"
+                         maxlength="2048" value="https://ntfy.sh" placeholder="https://ntfy.sh"
+                         aria-describedby="hint-ntfy-server err-ntfy-server">
+                  <p class="hint" id="hint-ntfy-server">Use https://ntfy.sh or your own HTTPS server. Local servers may use HTTP.</p>
+                  <p class="field-error" id="err-ntfy-server" role="alert" hidden></p>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="ntfy-topic">Topic</label>
+                  <input class="input" type="text" id="ntfy-topic" autocomplete="off" spellcheck="false"
+                         maxlength="64" placeholder="e.g. my-refresh-alerts"
+                         aria-describedby="hint-ntfy-topic err-ntfy-topic">
+                  <p class="hint" id="hint-ntfy-topic">Letters, numbers, dashes and underscores only, up to 64 characters. On a public server, anyone who knows the topic name can read it.</p>
+                  <p class="field-error" id="err-ntfy-topic" role="alert" hidden></p>
+                </div>
+              </div>
+
+              <div class="automation-actions">
+                <button class="btn btn-secondary btn-sm" type="button" id="ntfy-use"
+                        aria-describedby="hint-ntfy-use ntfy-note">Use ntfy settings</button>
+              </div>
+              <p class="status-line" id="ntfy-note" role="status" aria-live="polite"></p>
+              <p class="hint" id="hint-ntfy-use">
+                Replaces the URL, headers, body and events for end-of-watch alerts. This sends nothing.
+                Connect the webhook, then send a test or start watching. Re-enter any private server token after applying this setup.
+              </p>
+            </div>
+
             <div class="field-row">
               <div class="field">
                 <label class="field-label" for="automation-webhook-method">Request method</label>
                 <select class="input" id="automation-webhook-method" aria-describedby="hint-automation-webhook-method">
                   <option value="POST">POST &mdash; JSON body</option>
-                  <option value="GET">GET &mdash; query string</option>
+                  <option value="GET">GET &mdash; no body</option>
                 </select>
                 <p class="hint" id="hint-automation-webhook-method">POST sends JSON. GET calls the configured address without a body.</p>
               </div>
@@ -371,6 +419,19 @@
               Off by default. When it is on, automatic payloads also carry the page url, title and the reason your stop
               condition matched. Page text is never included, and a custom body only sees those values while this is on.
             </p>
+
+            <div class="automation-test">
+              <p class="hint" id="hint-automation-webhook-test">
+                Sends exactly one real request, now, to the webhook address and settings above, including a custom body
+                if you wrote one. It does not start, pause, stop or restart monitoring, and it runs no script. Nothing
+                is sent by this section unless you press this button.
+              </p>
+              <div class="automation-actions">
+                <button class="btn btn-secondary btn-sm" type="button" id="automation-webhook-test"
+                        aria-describedby="hint-automation-webhook-test automation-webhook-test-status">Send test notification</button>
+              </div>
+              <p class="status-line" id="automation-webhook-test-status" role="status" aria-live="polite"></p>
+            </div>
           </div>
         </section>
 
@@ -457,6 +518,7 @@
     <button class="btn btn-quiet btn-sm" type="button" id="stop-all">Stop all tabs</button>
     <a class="link" id="link-dashboard" href="options.html" target="_blank" rel="noopener">Dashboard</a>
     <a class="link" id="link-help" href="options.html#help" target="_blank" rel="noopener">Help &amp; privacy</a>
+    <a class="link" href="https://ko-fi.com/mouniryuga" target="_blank" rel="noopener noreferrer">Support development</a>
   </div>
 </footer>
 

@@ -31,6 +31,11 @@ import { describeWebhookUrl, normalizeActions, validateActions, permissionOrigin
 
 /** Whole-run budget: hooks must never hold a monitoring step open for longer. */
 export const RUN_ACTIONS_TIMEOUT_MS = 5000;
+/**
+ * One explicit UI "test webhook" is bounded by the same five seconds as a
+ * monitoring hook, and it is never retried.
+ */
+export const WEBHOOK_TEST_TIMEOUT_MS = 5000;
 /** Single structured-clone/JSON step cap while building a payload. */
 const MAX_TEXT_SNAPSHOT = 20000;
 /** Hard cap on the session-only activity log. */
@@ -45,6 +50,13 @@ const actionLog = [];
 const LOG_KEY = 'abraActionLog';
 let logHydration = null;
 let logWrites = Promise.resolve();
+
+/**
+ * tabId -> an explicit UI webhook test is in flight. The popup disables its
+ * button while it waits, and this guard makes a double click idempotent even if
+ * two requests race.
+ */
+const webhookTestsInFlight = new Set();
 
 function hydrateLog() {
   if (!logHydration) logHydration = (async () => {
@@ -390,30 +402,16 @@ async function hasWebhookAccess(url) {
 }
 
 /**
- * Run one webhook. Returns `{ outcome, httpStatus }`; never throws and never
- * exposes response content.
+ * The one bounded webhook fetch, shared by monitoring and by the explicit UI
+ * test. Exactly one request is made with credentials omitted, redirects
+ * refused, no cache and an abort after `timeoutMs`. The response body is never
+ * read, stored, logged or executed: only the numeric HTTP status comes back.
+ *
+ * Returns `{ outcome: 'delivered' | 'failed' | 'timeout', httpStatus }` where
+ * `failed` with a numeric status means the server answered an HTTP error and
+ * `failed` with a null status means the request never reached a server.
  */
-async function runWebhook({ record, event, reason, action, snapshot, timeoutMs }) {
-  if (isEnabled(action) !== true) return { outcome: 'disabled' };
-  const canonical = describeWebhookUrl(action.url);
-  if (!canonical.ok) return { outcome: 'bad-url' };
-  const url = canonical.url;
-
-  if ((await hasWebhookAccess(url)) !== true) return { outcome: 'no-permission' };
-  if (record.config?.actions?.webhook?.enabled === false) return { outcome: 'disabled' };
-
-  const method = action.method === 'GET' ? 'GET' : 'POST';
-  const includeDetails = action.includePageDetails === true;
-  const headers = headerMapFromText(action.headers);
-  if (!Object.keys(headers).some((name) => name.toLowerCase() === 'content-type')) {
-    headers['Content-Type'] = 'application/json';
-  }
-
-  const custom = buildCustomBody(action.body, snapshot);
-  const body = custom !== '' ? custom : stringifyJson({
-    ...buildAutoPayload(snapshot), ...(includeDetails ? pageDetailFields(snapshot) : {})
-  });
-
+async function dispatchWebhook({ url, method, headers, body, timeoutMs }) {
   const controller = typeof AbortController === 'function' ? new AbortController() : null;
   let timer = null;
   if (controller) {
@@ -444,10 +442,173 @@ async function runWebhook({ record, event, reason, action, snapshot, timeoutMs }
     return { outcome: response && response.ok === true ? 'delivered' : 'failed', httpStatus };
   } catch (error) {
     const message = safeError(error);
-    if (/abort/i.test(message)) return { outcome: 'timeout' };
-    return { outcome: 'failed' };
+    if (/abort/i.test(message)) return { outcome: 'timeout', httpStatus: null };
+    return { outcome: 'failed', httpStatus: null };
   } finally {
     if (timer !== null) clearTimeout(timer);
+  }
+}
+
+/**
+ * Run one webhook. Returns `{ outcome, httpStatus }`; never throws and never
+ * exposes response content.
+ */
+async function runWebhook({ record, event, reason, action, snapshot, timeoutMs }) {
+  if (isEnabled(action) !== true) return { outcome: 'disabled' };
+  const canonical = describeWebhookUrl(action.url);
+  if (!canonical.ok) return { outcome: 'bad-url' };
+  const url = canonical.url;
+
+  if ((await hasWebhookAccess(url)) !== true) return { outcome: 'no-permission' };
+  if (record.config?.actions?.webhook?.enabled === false) return { outcome: 'disabled' };
+
+  const method = action.method === 'GET' ? 'GET' : 'POST';
+  const includeDetails = action.includePageDetails === true;
+  const headers = headerMapFromText(action.headers);
+  if (!Object.keys(headers).some((name) => name.toLowerCase() === 'content-type')) {
+    headers['Content-Type'] = 'application/json';
+  }
+
+  const custom = buildCustomBody(action.body, snapshot);
+  const body = custom !== '' ? custom : stringifyJson({
+    ...buildAutoPayload(snapshot), ...(includeDetails ? pageDetailFields(snapshot) : {})
+  });
+
+  return dispatchWebhook({ url, method, headers, body, timeoutMs });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Explicit webhook test (trusted extension UI only)                          */
+/* -------------------------------------------------------------------------- */
+
+/** The same explicit-enabled coercion actions-core uses for stored profiles. */
+function isExplicitlyEnabled(value) {
+  return value === true || value === 'true' || value === 1;
+}
+
+/**
+ * Send exactly one test request for a webhook the user is editing in the popup.
+ *
+ * Contract (the background router proves the sender is an extension page
+ * before calling this; this function never requests a permission, never runs
+ * user code, and never starts, stops, pauses or otherwise changes a session):
+ *
+ *   { ok: true,  message, status }   one request was answered (HTTP status)
+ *   { ok: false, error }             refused, timed out or never delivered
+ *
+ * Rules:
+ *  - the webhook must be explicitly enabled, and its URL, method, header JSON,
+ *    body JSON and size caps are validated by the shared actions-core schema;
+ *  - it is sent only when the extension already holds the exact hostname grant
+ *    for that URL (never a request, never a wildcard);
+ *  - the event is always `test` with refreshCount 0, independent of the events
+ *    the webhook is set to run for; a custom body is serialized with the same
+ *    token substitution as a real delivery, so page URL/title appear only when
+ *    Include page details is on and the tab metadata is available;
+ *  - one test per tab may be in flight, and the outcome is logged generically
+ *    (event `test`) with no URL, header, body or response content.
+ */
+export async function testWebhook(options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const tabId = Number.isInteger(opts.tabId) ? opts.tabId : null;
+  if (tabId === null) return { ok: false, error: 'A tab id is required to test the webhook.' };
+  const raw = opts.webhook && typeof opts.webhook === 'object' && !Array.isArray(opts.webhook)
+    ? opts.webhook
+    : null;
+  if (!raw || !isExplicitlyEnabled(raw.enabled)) {
+    return { ok: false, error: 'Turn the webhook on before sending a test request.' };
+  }
+  if (webhookTestsInFlight.has(tabId)) {
+    return { ok: false, error: 'A test request is already in flight for this tab. Wait for it to finish.' };
+  }
+  webhookTestsInFlight.add(tabId);
+  try {
+    // Actions-core owns URL, method, header, body and length validation. The
+    // event list is forced so an in-progress selection cannot block a test;
+    // every other raw field is validated exactly as typed.
+    const validation = validateActions({ webhook: { ...raw, enabled: true, events: ['match'] } });
+    if (!validation.ok) {
+      await logEntry({
+        tabId,
+        event: 'test',
+        kind: 'webhook',
+        status: 'skipped',
+        message: 'A webhook test was not sent because the webhook settings are invalid.'
+      });
+      return { ok: false, error: validation.error || 'Check the webhook settings and try again.' };
+    }
+    const webhook = validation.actions.webhook;
+
+    if ((await hasWebhookAccess(webhook.url)) !== true) {
+      await logEntry({
+        tabId,
+        event: 'test',
+        kind: 'webhook',
+        status: 'skipped',
+        message: 'A webhook test was not sent because access to that hostname is not granted.'
+      });
+      return {
+        ok: false,
+        error: 'Webhook access is not granted for this hostname. Grant it in the automation settings, then test again.'
+      };
+    }
+
+    const includeDetails = webhook.includePageDetails === true;
+    const tab = includeDetails ? await getTopTab(tabId) : null;
+    // Synthetic snapshot: event "test", nothing counted, and page fields empty
+    // unless the user opted in and the tab metadata is available.
+    const snapshot = {
+      type: 'test',
+      timestamp: Date.now(),
+      refreshCount: 0,
+      status: 'test',
+      url: includeDetails && tab && typeof tab.url === 'string' ? tab.url : '',
+      title: includeDetails && tab && typeof tab.title === 'string' ? tab.title : '',
+      reason: '',
+      keyword: '',
+      selector: ''
+    };
+
+    const method = webhook.method === 'GET' ? 'GET' : 'POST';
+    const headers = headerMapFromText(webhook.headers);
+    if (!Object.keys(headers).some((name) => name.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'application/json';
+    }
+    const custom = buildCustomBody(webhook.body, snapshot);
+    const body = custom !== '' ? custom : stringifyJson({
+      ...buildAutoPayload(snapshot), ...(includeDetails ? pageDetailFields(snapshot) : {})
+    });
+
+    const result = await dispatchWebhook({
+      url: webhook.url,
+      method,
+      headers,
+      body,
+      timeoutMs: WEBHOOK_TEST_TIMEOUT_MS
+    });
+
+    if (typeof result.httpStatus === 'number') {
+      const delivered = result.outcome === 'delivered';
+      const message = `The webhook answered HTTP ${result.httpStatus}.`;
+      await logEntry({
+        tabId,
+        event: 'test',
+        kind: 'webhook',
+        status: delivered ? 'success' : 'failed',
+        message: delivered ? 'The test request was completed without reading the response body.' : message
+      });
+      if (delivered) return { ok: true, message, status: result.httpStatus };
+      return { ok: false, error: `${message} Check the receiving service and try again.` };
+    }
+
+    const timedOut = result.outcome === 'timeout';
+    const message = timedOut
+      ? `The test request did not finish within ${Math.round(WEBHOOK_TEST_TIMEOUT_MS / 1000)} seconds.`
+      : 'The test request could not be delivered. Check the address and the host access, then try again.';
+    await logEntry({ tabId, event: 'test', kind: 'webhook', status: 'failed', message });
+    return { ok: false, error: message };
+  } finally {
+    webhookTestsInFlight.delete(tabId);
   }
 }
 

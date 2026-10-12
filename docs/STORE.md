@@ -15,7 +15,11 @@ Choose a steady interval or randomize the delay. Watch the whole page or a selec
 
 Optional automation sends webhooks or runs your custom JavaScript on selected monitoring events. Webhooks request access to the configured hostname, and scripts require Chrome's optional User Scripts permission, site access, and Allow User Scripts setting. These features are off by default. Activity logs show hook outcomes; access can be revoked from the dashboard.
 
+Use guided ntfy setup and send a test notification before watching a page. Optional pause-on-interaction protects your workflow while clicking or typing. Settings remain independent per tab; reuse them explicitly through saved profiles. Starting a tab never silently changes shared defaults or enables automation on another tab.
+
 All features are free. No account, ads, subscriptions, analytics, or developer data collection. Monitoring runs on your device. Optional webhooks send the data you configure to your chosen endpoint; page details are excluded by default.
+
+A voluntary Support development link opens the developer's Ko-fi page. Supporting development is optional and does not unlock features. No payment code or tracking pixels are embedded in the extension.
 
 Timing may be delayed in background tabs or while the computer sleeps. Browser-internal pages and protected browser pages cannot be monitored.
 

@@ -16,11 +16,15 @@
  *   { type: 'PAUSE', tabId }           { type: 'RESUME', tabId }
  *   { type: 'GET_STATE', tabId }       { type: 'GET_ALL' }
  *   { type: 'PICK_ELEMENT', tabId }
+ *   { type: 'TEST_WEBHOOK', tabId, webhook }
  * Responses:
  *   { ok: true, state } | { ok: false, error }
  *   GET_ALL -> { ok: true, sessions: [state, ...] }
  *   PICK_ELEMENT -> { ok: true, state, pickedSelector } and also mirrors
  *                   { tabId, selector } into chrome.storage.local.pickedSelector
+ *   TEST_WEBHOOK -> { ok: true, message, status } (HTTP status) when a request
+ *                   was delivered, otherwise { ok: false, error }. It never
+ *                   requires a monitor and never changes session state.
  *
  * state = {
  *   tabId, url, title,
@@ -100,6 +104,9 @@ export const DEFAULT_CONFIG = Object.freeze({
   preserveScroll: true,
   bypassCache: false,
   pauseWhenHidden: false,
+  // Off by default: a trusted click or keystroke in the page pauses the session
+  // until the user resumes it by hand. Validated exactly like pauseWhenHidden.
+  pauseOnInteraction: false,
   ignoreSelector: '',
   actions: DEFAULT_ACTIONS
 });
@@ -114,7 +121,8 @@ export const UI_MESSAGE_TYPES = Object.freeze([
   'PICK_ELEMENT',
   'ACTION_CAPABILITIES',
   'ACTION_LOG',
-  'DISABLE_ACTION'
+  'DISABLE_ACTION',
+  'TEST_WEBHOOK'
 ]);
 
 /** Content-script -> background message types (engine internal). */
@@ -122,7 +130,8 @@ export const CONTENT_MESSAGE_TYPES = Object.freeze([
   'ABRA_REPORT',
   'ABRA_PICKED',
   'ABRA_PICK_CANCELLED',
-  'ABRA_COUNTDOWN'
+  'ABRA_COUNTDOWN',
+  'ABRA_INTERACTION'
 ]);
 
 /**
@@ -401,6 +410,7 @@ export function validateConfig(raw) {
   config.preserveScroll = readBooleanField(input, 'preserveScroll', errors, DEFAULT_CONFIG.preserveScroll);
   config.bypassCache = readBooleanField(input, 'bypassCache', errors, DEFAULT_CONFIG.bypassCache);
   config.pauseWhenHidden = readBooleanField(input, 'pauseWhenHidden', errors, DEFAULT_CONFIG.pauseWhenHidden);
+  config.pauseOnInteraction = readBooleanField(input, 'pauseOnInteraction', errors, DEFAULT_CONFIG.pauseOnInteraction);
 
   config.settleSeconds = readNumberField(input, 'settleSeconds', errors, {
     min: 0,
@@ -1081,6 +1091,173 @@ export function shouldAcceptCountdown(lastAcceptedAt, now = Date.now(), minGapMs
   if (nowMs === null) return false;
   const gap = toFiniteNumber(minGapMs);
   return nowMs - last >= (gap === null ? COUNTDOWN_MIN_GAP_MS : gap);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Interaction pausing                                                        */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Input types that are controls rather than text fields: typing does not apply
+ * to them, but Enter/Space activates them like a click.
+ */
+export const NON_TEXT_INPUT_TYPES = Object.freeze([
+  'button',
+  'checkbox',
+  'color',
+  'file',
+  'hidden',
+  'image',
+  'radio',
+  'range',
+  'reset',
+  'submit'
+]);
+
+const NON_TEXT_INPUT_SET = new Set(NON_TEXT_INPUT_TYPES);
+
+const INTERACTION_CONTROL_ROLES = new Set([
+  'button',
+  'checkbox',
+  'link',
+  'menuitem',
+  'menuitemcheckbox',
+  'menuitemradio',
+  'option',
+  'radio',
+  'switch',
+  'tab'
+]);
+
+/**
+ * Local-only gesture classification. This object is never reported; the page
+ * sends only session identity and a trusted-gesture flag:
+ *   { kind: 'pointer' | 'key' | 'input', tagName?, inputType?,
+ *     isContentEditable?, role?, hasHref?, key? }
+ */
+function interactionInfo(info) {
+  return info && typeof info === 'object' ? info : {};
+}
+
+/** True when the interaction target is somewhere the user types text. */
+export function isEditableInteractionTarget(info) {
+  const source = interactionInfo(info);
+  if (source.isContentEditable === true) return true;
+  const tag = typeof source.tagName === 'string' ? source.tagName.toUpperCase() : '';
+  if (tag === 'TEXTAREA') return true;
+  if (tag !== 'INPUT') return false;
+  const type = typeof source.inputType === 'string' && source.inputType.trim() !== ''
+    ? source.inputType.trim().toLowerCase()
+    : 'text';
+  return !NON_TEXT_INPUT_SET.has(type);
+}
+
+/** True when Enter/Space on the target activates a link, button or control. */
+export function isInteractionControl(info) {
+  const source = interactionInfo(info);
+  const tag = typeof source.tagName === 'string' ? source.tagName.toUpperCase() : '';
+  if (tag === 'BUTTON' || tag === 'SELECT' || tag === 'SUMMARY') return true;
+  if (tag === 'A') return source.hasHref === true;
+  if (tag === 'INPUT') return !isEditableInteractionTarget(source);
+  const role = typeof source.role === 'string' ? source.role.toLowerCase() : '';
+  return INTERACTION_CONTROL_ROLES.has(role);
+}
+
+/**
+ * Decide whether an already-trusted gesture is meaningful enough to pause a
+ * running session: any primary pointer press, typing/input inside an editable
+ * field or contenteditable, and Enter/Space on a control.
+ *
+ * Synthetic events are filtered by the caller (`event.isTrusted`), the picker
+ * gestures are filtered by the caller too, and an unknown kind never matches.
+ */
+export function isMeaningfulInteraction(info) {
+  const source = interactionInfo(info);
+  if (!['pointer', 'key', 'input'].includes(source.kind)) return false;
+  if (source.kind === 'pointer') return true;
+  if (isEditableInteractionTarget(source)) return true;
+  if (source.kind === 'input') return false;
+  if (source.kind === 'key') {
+    const key = typeof source.key === 'string' ? source.key : '';
+    return (key === 'Enter' || key === ' ' || key === 'Spacebar') && isInteractionControl(source);
+  }
+  return false;
+}
+
+/**
+ * Fields that must never appear in an interaction report. The message is
+ * identity only: if it carries event, key, text or page data it is refused
+ * instead of being stored or forwarded anywhere.
+ */
+const INTERACTION_DATA_FIELDS = Object.freeze([
+  'data',
+  'key',
+  'selector',
+  'target',
+  'text',
+  'title',
+  'url',
+  'value'
+]);
+
+/**
+ * Validate the pause-on-interaction request sent by the monitored top frame.
+ *
+ * It is deliberately narrow, like `validateCountdownMessage`: the sender must
+ * be the top frame (frame 0) of the session tab, the token, generation and page
+ * origin must all still agree, the session must be running, pause-on-interaction
+ * must be enabled in the session config, and the payload must declare a real
+ * (non-synthetic) gesture and carry no data fields.
+ *
+ * The frame id, document id and origin used by the background come from the
+ * browser's `sender`, never from the page payload, so a stale or foreign
+ * document can never pause the replacement session.
+ */
+export function validateInteractionMessage(record, sender, msg) {
+  if (!sender || !sender.tab || !Number.isInteger(sender.tab.id)) {
+    return { ok: false, error: 'Message rejected: sender is not a monitored tab.' };
+  }
+  if (sender.frameId !== 0) {
+    return { ok: false, error: 'Message rejected: the interaction must come from the top frame.' };
+  }
+  if (!msg || typeof msg !== 'object' || msg.type !== 'ABRA_INTERACTION') {
+    return { ok: false, error: 'Message rejected: malformed interaction payload.' };
+  }
+  if (msg.trusted !== true) {
+    return { ok: false, error: 'Message rejected: only a real user interaction can pause.' };
+  }
+  for (const field of INTERACTION_DATA_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(msg, field)) {
+      return { ok: false, error: 'Message rejected: interaction reports carry identity only.' };
+    }
+  }
+  if (!record) {
+    return { ok: false, error: 'Message rejected: no active session for this tab.' };
+  }
+  if (!record.config || record.config.pauseOnInteraction !== true) {
+    return { ok: false, error: 'Message rejected: pause on interaction is off for this session.' };
+  }
+  if (record.documentId && sender.documentId !== record.documentId) {
+    return { ok: false, error: 'Message rejected: this is not the monitored document.' };
+  }
+  if (sender.tab.id !== record.tabId || Number(msg.tabId) !== record.tabId) {
+    return { ok: false, error: 'Message rejected: sender does not match the session tab.' };
+  }
+  if (typeof msg.token !== 'string' || msg.token === '' || msg.token !== record.token) {
+    return { ok: false, error: 'Message rejected: session token mismatch.' };
+  }
+  if (toFiniteNumber(msg.generation) !== (toFiniteNumber(record.generation) ?? 0)) {
+    return { ok: false, error: 'Message rejected: stale session generation.' };
+  }
+  const senderOrigin =
+    typeof sender.origin === 'string' && sender.origin !== '' ? sender.origin : originOf(sender.url);
+  if (record.origin && senderOrigin !== record.origin) {
+    return { ok: false, error: 'Message rejected: the page origin changed.' };
+  }
+  if (record.status !== 'running') {
+    return { ok: false, error: 'Message rejected: the session is no longer running.' };
+  }
+  return { ok: true };
 }
 
 /* -------------------------------------------------------------------------- */

@@ -53,12 +53,13 @@ import {
   validateConfig,
   validateContentMessage,
   validateCountdownMessage,
+  validateInteractionMessage,
   validatePickMessage,
   validateUiMessage,
   watchdogDelayMs,
   withDefaults
 } from './core.js';
-import { runActions, getActionCapabilities, getActionLog } from './actions.js';
+import { runActions, getActionCapabilities, getActionLog, testWebhook } from './actions.js';
 
 const SESSION_KEY = 'abraSessions';
 const PICKED_KEY = 'pickedSelector';
@@ -401,6 +402,7 @@ async function ensureContent(tabId) {
  * nextRefreshAt when the cadence must not be disturbed.
  */
 async function attachSession(record, delayMs) {
+  delete record.reloadInteractionGeneration;
   const wait = Math.max(0, toFiniteNumber(delayMs) || 0);
   const response = await sendToTab(record.tabId, {
     type: 'ABRA_SESSION',
@@ -553,7 +555,9 @@ async function runCheck(record, msg) {
     return { ok: false, error: 'Message rejected: the session changed.' };
   }
   if (record.status !== 'running') {
-    return { ok: false, error: 'Message rejected: the session is not running.' };
+    // A report that was already queued when the session paused (or ended) must
+    // never reload: answer benignly so the page simply stops counting down.
+    return { ok: true, action: 'wait' };
   }
 
   const now = Date.now();
@@ -582,7 +586,7 @@ async function runCheck(record, msg) {
   record.nextRefreshAt = plan.nextRefreshAt;
   await fireActions(record, 'check', plan.reason);
   if (sessions.get(record.tabId) !== record || record.status !== 'running'
-      || !await isCurrentDocument(record)) return { ok: true, action: 'wait' };
+      || !await isCurrentDocument(record) || record.interactionRequested) return { ok: true, action: 'wait' };
 
   if (plan.kind === 'matched') {
     return finishWithMatched(record, plan.reason);
@@ -609,7 +613,7 @@ async function runCheck(record, msg) {
 
   await fireActions(record, 'before-refresh', plan.reason);
   if (sessions.get(record.tabId) !== record || record.status !== 'running'
-      || !await isCurrentDocument(record)) return { ok: true, action: 'wait' };
+      || !await isCurrentDocument(record) || record.interactionRequested) return { ok: true, action: 'wait' };
   record.refreshCount = plan.refreshCount;
   record.lastReloadAt = now;
   record.reloadPendingAt = now;
@@ -619,12 +623,15 @@ async function runCheck(record, msg) {
     type: 'ABRA_PREPARE_RELOAD', tabId: record.tabId,
     token: record.token, generation: record.generation
   });
+  if (record.interactionRequested || record.status !== 'running') return { ok: true, action: 'wait' };
   if (!prepared.ok) return finishWithError(record, 'The page could not prepare for its next refresh.');
+  record.reloadInteractionGeneration = record.generation;
   bumpGeneration(record);
   record.pendingRefreshCount = record.refreshCount;
   await persistSessions();
   scheduleWatchdog(record);
   refreshBadge(record);
+  if (record.interactionRequested || record.status !== 'running') return { ok: true, action: 'wait' };
   try {
     await chrome.tabs.reload(record.tabId, { bypassCache: record.config.bypassCache });
   } catch (error) {
@@ -717,26 +724,34 @@ async function handleStop(msg) {
 async function handlePause(msg) {
   const tabId = readTabId(msg);
   if (tabId === null) return { ok: false, error: 'A tab id is required to pause monitoring.' };
-  return withTabLock(tabId, async () => {
-    const record = sessions.get(tabId);
-    if (!record) return { ok: false, error: 'No monitoring session for this tab.' };
-    if (record.status === 'paused') return { ok: true, state: publicSessionState(record) };
-    if (record.status !== 'running') {
-      return { ok: false, error: `This tab is not being monitored (status: ${record.status}).` };
-    }
-    bumpGeneration(record);
-    record.status = 'paused';
-    record.nextRefreshAt = null;
-    record.scheduledFor = null;
-    record.reloadPendingAt = null;
-    record.lastResult = { met: false, reason: 'Paused by the user.', checkedAt: Date.now() };
-    clearWatchdog(tabId);
-    refreshBadge(record);
-    await notifyStatus(record, 'paused');
-    await persistSessions();
-    await fireActions(record, 'pause');
-    return { ok: true, state: publicSessionState(record) };
-  });
+  return withTabLock(tabId, () => pauseSession(sessions.get(tabId), 'Paused by the user.'));
+}
+
+/**
+ * The one pause transition, shared by the popup's Pause button and automatic
+ * pause-on-interaction. Callers own the per-tab lock: this function must never
+ * take it, or an interaction arriving while a check is in flight would deadlock
+ * against its own tab.
+ */
+async function pauseSession(record, reason) {
+  if (!record) return { ok: false, error: 'No monitoring session for this tab.' };
+  if (record.status === 'paused') return { ok: true, state: publicSessionState(record) };
+  if (record.status !== 'running') {
+    return { ok: false, error: `This tab is not being monitored (status: ${record.status}).` };
+  }
+  bumpGeneration(record);
+  record.status = 'paused';
+  delete record.interactionRequested;
+  record.nextRefreshAt = null;
+  record.scheduledFor = null;
+  record.reloadPendingAt = null;
+  record.lastResult = { met: false, reason, checkedAt: Date.now() };
+  clearWatchdog(record.tabId);
+  refreshBadge(record);
+  await notifyStatus(record, 'paused');
+  await persistSessions();
+  await fireActions(record, 'pause');
+  return { ok: true, state: publicSessionState(record) };
 }
 
 async function handleResume(msg) {
@@ -808,6 +823,22 @@ async function handleGetAll() {
   return { ok: true, sessions: list };
 }
 
+/**
+ * Explicit "send one test request" for the trusted extension UI only.
+ *
+ * The message router has already proven the sender is an extension page. This
+ * handler adds nothing else: no monitor is required, no permission is ever
+ * requested here, no page code runs, and no session state is read or changed.
+ * `testWebhook` owns the single bounded fetch, the actions-core validation and
+ * the per-tab in-flight guard; its result is returned to the UI unchanged.
+ */
+async function handleTestWebhook(msg) {
+  const tabId = readTabId(msg);
+  if (tabId === null) return { ok: false, error: 'A tab id is required to test the webhook.' };
+  if (!await getTabInfo(tabId)) return { ok: false, error: 'That tab is no longer open.' };
+  return testWebhook({ tabId, webhook: msg.webhook });
+}
+
 async function handlePickElement(msg) {
   const tabId = readTabId(msg);
   if (tabId === null) return { ok: false, error: 'A tab id is required to pick an element.' };
@@ -856,6 +887,9 @@ async function handleReport(msg, sender) {
   if (sender.frameId !== 0 || (record.documentId && sender.documentId !== record.documentId)) {
     return { ok: false, error: 'Message rejected: this is not the monitored document.' };
   }
+  // A report that was already queued when the session paused must be inert: it
+  // may not move the schedule, flip a status or authorize a reload.
+  if (record.status !== 'running') return { ok: true, action: 'wait' };
 
   const now = Date.now();
   record.watchdogRetries = 0;
@@ -913,6 +947,47 @@ function handleCountdown(msg, sender) {
   state.lastCountdownAt = now;
   refreshBadge(record, now);
   return { ok: true };
+}
+
+/**
+ * A trusted gesture in the monitored top frame asks for a pause (pause on
+ * interaction). The payload is identity only; the sender's frame id, document
+ * id and origin are supplied by the browser, and both are checked before the
+ * shared pause transition runs. Once the record pauses, its generation moves,
+ * so any other in-flight message from the old document is refused.
+ */
+async function handleInteraction(msg, sender) {
+  const tabId = sender.tab.id;
+  const record = sessions.get(tabId) || null;
+  // Reload preparation advances the engine generation while the old document
+  // remains visible. Its gestures may still cancel that pending navigation.
+  const interactionRecord = current => current && current.reloadPendingAt != null
+    && current.reloadInteractionGeneration === msg.generation
+    && current.documentId && sender.documentId === current.documentId
+    ? { ...current, generation: msg.generation } : current;
+  const validation = validateInteractionMessage(interactionRecord(record), sender, msg);
+  if (!validation.ok) return validation;
+  if (sender.frameId !== 0 || (record.documentId && sender.documentId !== record.documentId)) {
+    return { ok: false, error: 'Message rejected: this is not the monitored document.' };
+  }
+  // Invalidate a pending reload before waiting behind a slow event hook.
+  // Identity is validated first; this flag affects only this exact record.
+  record.interactionRequested = true;
+  return withTabLock(tabId, async () => {
+    const current = sessions.get(tabId);
+    // The lock may have waited behind a check: the record must be the same one
+    // that was validated, still running and still opted in.
+    if (current !== record) return { ok: false, error: 'Message rejected: the session changed.' };
+    const checked = validateInteractionMessage(interactionRecord(current), sender, msg);
+    if (!checked.ok) { delete current.interactionRequested; return checked; }
+    if (current.status !== 'running') {
+      return { ok: false, error: 'Message rejected: the session is no longer running.' };
+    }
+    if (!current.config || current.config.pauseOnInteraction !== true) {
+      return { ok: false, error: 'Message rejected: pause on interaction is off for this session.' };
+    }
+    return pauseSession(current, 'Paused automatically after you used the page. Press Resume to continue.');
+  });
 }
 
 async function handlePicked(msg, sender) {
@@ -1050,6 +1125,7 @@ async function handleAlarm(alarm) {
 
 async function handleTabRemoved(tabId) {
   await ensureHydrated();
+  try { await chrome.storage.session.remove([`popupDraft:${tabId}`, `popupSettings:${tabId}`]); } catch { /* Best effort cleanup. */ }
   await withTabLock(tabId, async () => {
     sessions.delete(tabId);
     picks.delete(tabId);
@@ -1111,6 +1187,8 @@ async function handleContentMessage(msg, sender) {
       return handleReport(msg, sender);
     case 'ABRA_COUNTDOWN':
       return handleCountdown(msg, sender);
+    case 'ABRA_INTERACTION':
+      return handleInteraction(msg, sender);
     case 'ABRA_PICKED':
       return handlePicked(msg, sender);
     case 'ABRA_PICK_CANCELLED':
@@ -1153,6 +1231,8 @@ async function handleIncoming(msg, sender) {
       return handleGetAll();
     case 'PICK_ELEMENT':
       return handlePickElement(msg);
+    case 'TEST_WEBHOOK':
+      return handleTestWebhook(msg);
     case 'ACTION_CAPABILITIES': {
       const tabId = readTabId(msg);
       const tab = tabId === null ? null : await getTabInfo(tabId);

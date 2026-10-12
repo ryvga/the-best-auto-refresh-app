@@ -9,6 +9,8 @@
  *   - preserve scroll position across reloads;
  *   - keep the toolbar countdown alive after the popup closes with a one-per-
  *     second ABRA_COUNTDOWN heartbeat (identity only, no page content);
+ *   - pause a running session on a real user gesture when pauseOnInteraction
+ *     is on (identity-only ABRA_INTERACTION, never synthetic events);
  *   - render the element picker overlay.
  *
  * It never decides on its own whether a condition matched: it reports a
@@ -21,7 +23,7 @@
 (() => {
   'use strict';
 
-  const VERSION = 1;
+  const VERSION = 3;
   const PICKER_ATTR = 'data-abra-picker';
   const SCROLL_KEY = '__abra_scroll_v1';
   const MAX_TEXT_CHARS = 200000;
@@ -51,6 +53,7 @@
     // the session without installing a second message listener.
     return;
   }
+  if (typeof globalThis.__ABRA_ENGINE__?.dispose === 'function') globalThis.__ABRA_ENGINE__.dispose();
 
   /* ---------------------------------------------------------------------- */
   /* Duplicated pure helpers (mirror extension/core.js)                      */
@@ -114,6 +117,69 @@
       .replace(/\f/g, '\\c ');
   }
 
+  /**
+   * Interaction classification (mirror of core.js). The page only ever builds
+   * the tiny plain-object shape these helpers expect; no event, key or text
+   * data is ever placed in the message to the background.
+   */
+  const NON_TEXT_INPUT_TYPES = new Set([
+    'button',
+    'checkbox',
+    'color',
+    'file',
+    'hidden',
+    'image',
+    'radio',
+    'range',
+    'reset',
+    'submit'
+  ]);
+  const INTERACTION_CONTROL_ROLES = new Set([
+    'button',
+    'checkbox',
+    'link',
+    'menuitem',
+    'menuitemcheckbox',
+    'menuitemradio',
+    'option',
+    'radio',
+    'switch',
+    'tab'
+  ]);
+
+  function isEditableInteractionTarget(info) {
+    if (info.isContentEditable === true) return true;
+    const tag = typeof info.tagName === 'string' ? info.tagName.toUpperCase() : '';
+    if (tag === 'TEXTAREA') return true;
+    if (tag !== 'INPUT') return false;
+    const type = typeof info.inputType === 'string' && info.inputType.trim() !== ''
+      ? info.inputType.trim().toLowerCase()
+      : 'text';
+    return !NON_TEXT_INPUT_TYPES.has(type);
+  }
+
+  function isInteractionControl(info) {
+    const tag = typeof info.tagName === 'string' ? info.tagName.toUpperCase() : '';
+    if (tag === 'BUTTON' || tag === 'SELECT' || tag === 'SUMMARY') return true;
+    if (tag === 'A') return info.hasHref === true;
+    if (tag === 'INPUT') return !isEditableInteractionTarget(info);
+    const role = typeof info.role === 'string' ? info.role.toLowerCase() : '';
+    return INTERACTION_CONTROL_ROLES.has(role);
+  }
+
+  function isMeaningfulInteraction(info) {
+    if (!info || typeof info !== 'object') return false;
+    if (!['pointer', 'key', 'input'].includes(info.kind)) return false;
+    if (info.kind === 'pointer') return true;
+    if (isEditableInteractionTarget(info)) return true;
+    if (info.kind === 'input') return false;
+    if (info.kind === 'key') {
+      const key = typeof info.key === 'string' ? info.key : '';
+      return (key === 'Enter' || key === ' ' || key === 'Spacebar') && isInteractionControl(info);
+    }
+    return false;
+  }
+
   /* ---------------------------------------------------------------------- */
   /* Page state                                                             */
   /* ---------------------------------------------------------------------- */
@@ -127,8 +193,18 @@
   let picker = null;
   let countdownTimerId = 0;
   let countdownSeq = 0;
+  let interactionWatchBound = false;
+  let interactionPending = false;
 
   const engine = { version: VERSION };
+  engine.dispose = () => {
+    abortCycle();
+    stopCountdown();
+    stopInteractionWatch();
+    stopPicker();
+    session = null;
+    engine.disposed = true;
+  };
 
   function clearTimer() {
     if (timerId) {
@@ -204,6 +280,149 @@
     stopCountdown();
     if (!session || session.status !== 'running') return;
     scheduleCountdown(countdownSeq);
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Pause on interaction                                                   */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * Pause-on-interaction listeners only exist while the session runs with the
+   * option enabled. They observe gestures and send identity only; the decision
+   * to pause is the background's.
+   */
+
+  function stopInteractionWatch() {
+    if (!interactionWatchBound) return;
+    interactionWatchBound = false;
+    document.removeEventListener('pointerdown', onInteractionPointer, true);
+    document.removeEventListener('keydown', onInteractionKey, true);
+    document.removeEventListener('beforeinput', onInteractionInput, true);
+  }
+
+  function startInteractionWatch() {
+    if (!session || session.status !== 'running' || session.config.pauseOnInteraction !== true) {
+      stopInteractionWatch();
+      return;
+    }
+    if (interactionWatchBound) return;
+    interactionWatchBound = true;
+    document.addEventListener('pointerdown', onInteractionPointer, true);
+    document.addEventListener('keydown', onInteractionKey, true);
+    document.addEventListener('beforeinput', onInteractionInput, true);
+  }
+
+  /**
+   * Only a real user gesture may pause: synthetic events (`isTrusted` false)
+   * are ignored, an open picker owns the click, and our own picker overlay is
+   * never treated as page interaction.
+   */
+  function interactionAllowed(event) {
+    if (!session || session.status !== 'running') return false;
+    if (session.config.pauseOnInteraction !== true) return false;
+    if (picker) return false;
+    if (!event || event.isTrusted !== true) return false;
+    const target = event.target;
+    if (target && typeof target.closest === 'function' && target.closest(`[${PICKER_ATTR}]`)) return false;
+    return true;
+  }
+
+  /** Build the tiny identity-free classification object for one event target. */
+  function interactionInfoFor(event) {
+    const info = { kind: '', tagName: '', inputType: '', role: '', hasHref: false, isContentEditable: false };
+    let element = event.target;
+    if (element && element.nodeType !== 1) element = element.parentElement;
+    if (element && element.nodeType === 1) {
+      info.tagName = element.tagName;
+      if (element.tagName === 'INPUT') {
+        try {
+          info.inputType = element.getAttribute('type') || '';
+        } catch {
+          info.inputType = '';
+        }
+      }
+      try {
+        info.role = element.getAttribute('role') || '';
+      } catch {
+        info.role = '';
+      }
+      if (element.tagName === 'A') {
+        try {
+          info.hasHref = Boolean(element.getAttribute('href'));
+        } catch {
+          info.hasHref = false;
+        }
+      }
+      let node = element;
+      while (node && node.nodeType === 1 && node.isContentEditable !== true) node = node.parentElement;
+      info.isContentEditable = document.designMode === 'on' || Boolean(node && node.isContentEditable === true);
+    }
+    return info;
+  }
+
+  function onInteractionPointer(event) {
+    if (!interactionAllowed(event)) return;
+    if (typeof event.button === 'number' && event.button !== 0) return;
+    if (event.isPrimary === false) return;
+    requestInteractionPause();
+  }
+
+  function onInteractionKey(event) {
+    if (!interactionAllowed(event)) return;
+    const key = typeof event.key === 'string' ? event.key : '';
+    if (key === 'Alt' || key === 'CapsLock' || key === 'Control' || key === 'Meta' || key === 'Shift') return;
+    const info = interactionInfoFor(event);
+    info.kind = 'key';
+    info.key = key;
+    if (!isMeaningfulInteraction(info)) return;
+    requestInteractionPause();
+  }
+
+  function onInteractionInput(event) {
+    if (!interactionAllowed(event)) return;
+    const info = interactionInfoFor(event);
+    info.kind = 'input';
+    if (!isMeaningfulInteraction(info)) return;
+    requestInteractionPause();
+  }
+
+  /**
+   * Ask the background to pause the current session. The page timers are
+   * stopped *before* the message is awaited, so a gesture that lands near the
+   * deadline cannot race a reload that was already due. The payload is identity
+   * only; the frame, document id and origin are added by the browser's sender.
+   */
+  function requestInteractionPause() {
+    if (!session || session.status !== 'running') return;
+    if (session.config.pauseOnInteraction !== true) return;
+    if (interactionPending) return;
+    interactionPending = true;
+    abortCycle();
+    stopCountdown();
+    stopInteractionWatch();
+    const tabId = session.tabId;
+    const token = session.token;
+    const generation = session.generation;
+    sendMessage({
+      type: 'ABRA_INTERACTION',
+      tabId,
+      token,
+      generation,
+      trusted: true
+    }).then((response) => {
+      interactionPending = false;
+      if (!session || session.tabId !== tabId || session.token !== token) return;
+      if (response && response.ok === true) {
+        abortCycle();
+        session.status = 'paused';
+        stopCountdown();
+        stopInteractionWatch();
+        return;
+      }
+      // Refused (stale identity, a stopped session, or the option is off):
+      // never resume on our own and never act on an unvalidated answer.
+      if (session.status === 'running') stopForStaleAnswer(response);
+    });
   }
 
   /* ---------------------------------------------------------------------- */
@@ -441,8 +660,7 @@
   function prepareReload() {
     rememberScroll();
     abortCycle();
-    // This document is about to be replaced; the next attach restarts the
-    // heartbeat in the fresh document.
+    // Keep gestures observable until navigation actually replaces this document.
     stopCountdown();
     return { ok: true };
   }
@@ -472,6 +690,7 @@
     // session). Never reload on an unvalidated answer.
     abortCycle();
     stopCountdown();
+    stopInteractionWatch();
     if (session) session.status = 'stopped';
     if (response && response.error) {
       try {
@@ -491,6 +710,7 @@
     if (action === 'stop' || action === 'pause') {
       abortCycle();
       stopCountdown();
+      stopInteractionWatch();
       if (session) session.status = action === 'stop' ? 'stopped' : 'paused';
       return;
     }
@@ -826,6 +1046,7 @@
       // Re-injection or a re-attach resets the heartbeat instead of stacking a
       // second timer, and stops it when the attached status is not running.
       startCountdown();
+      startInteractionWatch();
       if (session.status === 'running') {
         const delayMs = Math.max(0, Number(msg.delayMs) || 0);
         const seq = cycleSeq;
@@ -853,6 +1074,7 @@
 
     if (msg.type === 'ABRA_PREPARE_RELOAD') {
       if (!identityMatches(msg)) return Promise.resolve({ ok: false, error: 'stale session identity' });
+      if (interactionPending) return Promise.resolve({ ok: false, error: 'interaction pause pending' });
       return Promise.resolve(prepareReload());
     }
 
@@ -867,8 +1089,13 @@
       const status = String(msg.status || 'stopped');
       abortCycle();
       if (session) session.status = status;
-      if (status === 'running') startCountdown();
-      else stopCountdown();
+      if (status === 'running') {
+        startCountdown();
+        startInteractionWatch();
+      } else {
+        stopCountdown();
+        stopInteractionWatch();
+      }
       if (status !== 'running') stopPicker();
       return Promise.resolve({ ok: true, status });
     }
@@ -886,6 +1113,7 @@
   }
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (engine.disposed) return false;
     let result = null;
     try {
       result = handleMessage(msg);
@@ -951,6 +1179,7 @@
     () => {
       abortCycle();
       stopCountdown();
+      stopInteractionWatch();
       stopPicker();
     },
     true

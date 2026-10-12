@@ -47,6 +47,8 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     preserveScroll: true,
     bypassCache: false,
     pauseWhenHidden: false,
+    // Off by default; the engine owns the pause itself and waits for Resume.
+    pauseOnInteraction: false,
     ignoreSelector: '',
     actions: DEFAULT_ACTIONS
   });
@@ -147,7 +149,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     'keyword-panel', 'keyword', 'selector-panel', 'selector',
     'settle-seconds', 'max-refreshes', 'max-minutes', 'ignore-selector',
     'case-sensitive', 'whole-word', 'preserve-scroll', 'bypass-cache',
-    'pause-when-hidden', 'defaults-alert', 'defaults-note', 'save-defaults',
+    'pause-when-hidden', 'pause-on-interaction', 'defaults-alert', 'defaults-note', 'save-defaults',
     'reset-defaults', 'profile-name', 'save-profile', 'profiles-list',
     'profiles-note', 'profiles-alert', 'app-version',
     'refresh-permissions', 'permissions-status', 'permissions-alert', 'permissions-list'
@@ -232,6 +234,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
       preserveScroll: source.preserveScroll !== false,
       bypassCache: source.bypassCache === true,
       pauseWhenHidden: source.pauseWhenHidden === true,
+      pauseOnInteraction: source.pauseOnInteraction === true,
       ignoreSelector: typeof source.ignoreSelector === 'string' ? source.ignoreSelector : '',
       // Automation survives every defaults/profile round trip untouched.
       actions: normalizeActions(source.actions)
@@ -603,6 +606,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
       preserveScroll: ui['preserve-scroll'].checked,
       bypassCache: ui['bypass-cache'].checked,
       pauseWhenHidden: ui['pause-when-hidden'].checked,
+      pauseOnInteraction: ui['pause-on-interaction'].checked,
       ignoreSelector,
       // Never edited here, but always carried: saving defaults or a profile from
       // the dashboard keeps whatever automation the popup already stored.
@@ -636,6 +640,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     ui['preserve-scroll'].checked = config.preserveScroll;
     ui['bypass-cache'].checked = config.bypassCache;
     ui['pause-when-hidden'].checked = config.pauseWhenHidden;
+    ui['pause-on-interaction'].checked = config.pauseOnInteraction;
     ui['ignore-selector'].value = config.ignoreSelector;
 
     syncConditionalPanels();

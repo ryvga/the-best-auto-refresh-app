@@ -184,7 +184,7 @@ const TIMEOUT = 4000;
 
     // An explicit popup Save as default commits a valid current config and
     // clears only this tab's stale draft. A subsequent dashboard change proves
-    // that this tab now takes later global defaults as well.
+    // that this tab keeps its own settings while an untouched tab follows defaults.
     popup = await openPopup(tabIds[0]);
     await popup.locator('label[for="mode-fixed"]').click({ timeout: TIMEOUT });
     await popup.locator('#interval-seconds').fill('5', { timeout: TIMEOUT });
@@ -206,9 +206,9 @@ const TIMEOUT = 4000;
     await expectConfig(popup, { preset: 'custom', mode: 'random', minSeconds: '23', maxSeconds: '53', stopCondition: 'never', settleSeconds: '4' });
     await popup.close({ runBeforeUnload: false, timeout: TIMEOUT });
     popup = await openPopup(tabIds[0]);
-    await expectConfig(popup, { preset: 'custom', mode: 'random', minSeconds: '23', maxSeconds: '53', stopCondition: 'never', settleSeconds: '4' });
+    await expectConfig(popup, { preset: 'custom', mode: 'fixed', intervalSeconds: '5', stopCondition: 'keyword-found', keyword: 'Fixture content' });
     await popup.close({ runBeforeUnload: false, timeout: TIMEOUT });
-    record('Popup Save as default clears its draft; later dashboard defaults reach both tabs');
+    record('Popup Save as default clears its draft and keeps this tab independent of later dashboard defaults');
 
     // Configure a distinct draft and enter the real popup picker flow. The
     // selected selector should replace the prior value while every other
@@ -262,7 +262,7 @@ const TIMEOUT = 4000;
 
     // A successful Start clears the tab draft. The fixture already contains
     // this keyword, so the engine can match promptly; changing defaults after
-    // the popup closes then verifies reopening follows those newer defaults.
+    // the popup closes then verifies this tab keeps its own started settings.
     popup = await openPopup(tabIds[0]);
     await popup.locator('label[for="mode-fixed"]').click({ timeout: TIMEOUT });
     await popup.locator('#interval-seconds').fill('5', { timeout: TIMEOUT });
@@ -286,10 +286,10 @@ const TIMEOUT = 4000;
     await options.locator('#save-defaults').click({ timeout: TIMEOUT });
     await options.waitForFunction(() => document.querySelector('#defaults-note').textContent.trim() !== '', null, { timeout: TIMEOUT });
     popup = await openPopup(tabIds[0]);
-    await expectConfig(popup, { preset: 'custom', mode: 'random', minSeconds: '31', maxSeconds: '61', stopCondition: 'never' });
+    await expectConfig(popup, { preset: 'custom', mode: 'fixed', intervalSeconds: '5', stopCondition: 'keyword-found', keyword: 'Fixture content' });
     await popup.screenshot({ path: path.join(out, 'start-cleared-draft.png'), fullPage: true, timeout: TIMEOUT });
     await popup.close({ runBeforeUnload: false, timeout: TIMEOUT });
-    record('Successful Start clears its draft so reopening uses later saved defaults');
+    record('Successful Start clears its draft and preserves this tab settings independently of later defaults');
 
     assert.deepEqual(errors, [], 'extension pages should not report JavaScript or console errors');
     record('No extension page JavaScript or console errors');

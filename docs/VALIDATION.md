@@ -1,5 +1,19 @@
 # Validation
 
+## Version 1.3.0 — independent tabs and notification setup
+
+Validated with Node.js 25 and Helium 141 in fresh disposable profiles. Required and optional permissions are unchanged. No external webhook, payment, advertising injection or Store submission occurred.
+
+- 74 unit tests passed, covering the engine, interaction message validation, ntfy JSON generation, existing host grants, private test payloads, denied redirects, browser-managed headers and duplicate test requests.
+- 21 new real MV3 checks passed: trusted interaction pause and synthetic-event rejection; cancellation during slow before-refresh hooks and delayed pre-navigation persistence; webhook test outcomes, authorization, timeout/no retry, private logs and unchanged monitoring; ntfy setup and unfinished drafts; independent tab settings; explicit versus automatic profile automation; input edits and profile changes during a slow Start; closed-tab cleanup and 360/400px layout.
+- Existing browser suites passed: 24 refresh checks, 15 profile/countdown checks, 11 popup-draft checks and 14 automation checks. A popup-draft run under concurrent browser load hit a click timeout; its isolated rerun passed. These checks do not prove behavior in every browser/site.
+
+The production package contains only extension assets. Syntax, manifest/assets and diff checks pass. Google Chrome testing remains a separate pre-submission check. Personal Helium reload is still required to activate this build; tests used disposable profiles, without changing the user's browser settings.
+
+Workers: two bailian-tpp DeepSeek V4.1 Flash runs delivered UI/ntfy and engine/webhook changes. The orchestrator stopped their extended runs after code delivery (exit 1), reviewed and integrated the changes. Native GPT-6 Luna supplied additional unit tests and read-only review. Native GPT-6.1 Sol independently reviewed security and found the manual-profile draft race and interaction-listener timing gap; both were repaired and covered by browser regressions. A bailian-tpp Qwen3.8 Max review attempt delivered no result and was stopped; it is not counted as completed review.
+
+See [product and funding research](RESEARCH.md) for the competitor comparison and support-link decision. Every feature remains free; no ads were added.
+
 ## Version 1.2.0 — event automation
 
 Validated in the installed Helium 141 executable using fresh disposable profiles. The production manifest retains the four required permissions and declares userScripts and specific-host access as optional. Custom scripts use the documented Chrome 135+ one-shot API; stable Google Chrome remains a separate pre-submission check.

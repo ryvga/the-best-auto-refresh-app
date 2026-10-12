@@ -235,6 +235,14 @@
               <input type="checkbox" id="pause-when-hidden">
               <span>Pause while the tab is in the background</span>
             </label>
+            <label class="check" for="pause-on-interaction">
+              <input type="checkbox" id="pause-on-interaction" aria-describedby="hint-pause-on-interaction">
+              <span>Pause when I interact with the page</span>
+            </label>
+            <p class="hint" id="hint-pause-on-interaction">
+              Off by default. A trusted click or keystroke on the page pauses the monitor so it is not reloaded under
+              your hands, and it stays paused until you press Resume.
+            </p>
           </fieldset>
 
           <div class="field">
@@ -401,6 +409,7 @@
     <p class="footer-line footer-muted">
       The product name is a name, not a claim of an independently verified ranking. Open source under the MIT license.
     </p>
+    <p class="footer-line"><a class="link" href="https://ko-fi.com/mouniryuga" target="_blank" rel="noopener noreferrer">Support development on Ko-fi</a> &middot; Every feature is free.</p>
   </div>
 </footer>
 

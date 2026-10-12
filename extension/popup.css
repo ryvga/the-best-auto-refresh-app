@@ -745,6 +745,49 @@ select.input {
   gap: 8px;
 }
 
+/* ---------- ntfy quick setup (inside the webhook fields) ---------- */
+
+.ntfy-setup {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--teal);
+  border-radius: var(--radius-sm);
+}
+.ntfy-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.ntfy-title {
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.ntfy-setup .field-row { gap: 10px; }
+.ntfy-setup .hint code {
+  padding: 0 3px;
+  background: var(--teal-wash);
+  border-radius: 4px;
+}
+
+/* one explicit test request */
+
+.automation-test {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 2px;
+  border-top: 1px dashed var(--line-strong);
+}
+
 .textarea {
   display: block;
   width: 100%;
@@ -902,6 +945,7 @@ select.input {
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .event-grid { grid-template-columns: minmax(0, 1fr); }
   .automation-head { flex-wrap: wrap; }
+  .ntfy-head { flex-wrap: wrap; }
   .code-meta { flex-direction: column; gap: 4px; }
 }
 

@@ -14,8 +14,11 @@ No account. No ads. No paywalls. No analytics. Monitoring happens on your device
 - Live toolbar countdown while monitoring, even with the popup closed.
 - Quick profiles in the popup: save settings for this page, this website, or everywhere. Page profiles take priority over website profiles; unfinished edits always win. Choosing a profile loads settings without starting a monitor.
 - A dashboard for monitored tabs and saved profile management.
+- Optional pause when you click or type on the monitored page; continue with Resume when you are ready.
 - Optional automation hooks: webhooks and custom JavaScript on refreshes, checks, matches, limits, errors, start/stop, pause and resume. See [automation guide](docs/AUTOMATION.md).
+- Guided ntfy notification setup and a separate button to send one test webhook, without starting or changing a monitor.
 - Unfinished popup settings are remembered per tab during the browser session, so you can close the popup to copy a keyword and continue where you left off.
+- Start remembers settings only for the current tab. Shared defaults change only when explicitly saved. New tabs keep automation off, including automatic profile suggestions; explicitly choose a saved profile to reuse its webhook/script settings.
 - Explicit per-tab access using `activeTab`, with no all-websites permission request.
 
 ## Install locally in Chrome or Helium
@@ -48,6 +51,12 @@ For real browser checks, install Playwright as a development tool and run `node 
 ## Publishing
 
 Store publication is a separate later step. See [store preparation](docs/STORE.md) for draft listing copy and permission explanations. Store acceptance is determined by Google review. The extension is free to users; Google may charge a developer registration fee.
+
+## Support development
+
+Every feature is free. If the extension saves you time, you can [support Mounir on Ko-fi](https://ko-fi.com/mouniryuga). Support is voluntary and unlocks no features. The extension embeds no payment scripts or tracking pixels; clicking the link opens the external Ko-fi site.
+
+See the [competitor and funding research](docs/RESEARCH.md) for product comparisons, Morocco payment options and the decision to keep ads out of monitored pages.
 
 ## License
 

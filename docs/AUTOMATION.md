@@ -1,6 +1,6 @@
 # Automation hooks
 
-Automation is optional and starts only with a monitor you explicitly start. Normal refreshing needs no additional permission. Hooks are part of a saved profile, and unfinished hook settings stay in the tab's popup draft.
+Automation is optional. Event hooks run only with a monitor you explicitly start; the separate Send test notification button sends one webhook on your explicit click. Normal refreshing needs no additional permission. Hooks are part of a saved profile, and unfinished hook settings stay in the tab's popup draft. Start affects only that tab and does not overwrite shared defaults. New tabs leave automation off even when defaults or automatic profile suggestions contain enabled hooks; explicitly choose a saved profile to reuse them.
 
 ## Events
 
@@ -24,7 +24,7 @@ Enter an HTTPS endpoint, select events, and click Connect webhook. Local develop
 
 POST sends JSON; GET is also available. Blank body uses event metadata: event, timestamp, refresh count, and status. Page address, title, keyword, selector and reason are excluded unless you turn on Include page details. Page text is never included automatically.
 
-Custom headers are a JSON object. Headers and webhook URLs may contain credentials: they are stored locally in saved settings/profiles and temporary drafts. They are not copied to page scripts, activity logs, or this repository. Saved extension data is not encrypted.
+Custom headers are a JSON object. Bearer Authorization headers and tokens in endpoint query strings are allowed; username/password credentials embedded in a URL are rejected. These values are stored locally in saved settings/profiles and temporary drafts. They are not copied to page scripts, activity logs, or this repository. Saved extension data is not encrypted.
 
 A custom body must be valid JSON. Template variables can be placed inside strings: `{{event}}`, `{{timestamp}}`, `{{refreshCount}}`, `{{status}}`, `{{url}}`, `{{title}}`, `{{reason}}`, `{{keyword}}`, `{{selector}}`. Page-related variables are empty unless Include page details is enabled. Replacements are escaped through JSON serialization.
 
@@ -35,6 +35,20 @@ For example, a chat service accepting a `text` field can receive:
 ```
 
 Requests omit browser credentials/cookies, do not follow redirects, and time out after five seconds. They are not automatically retried, because retrying a webhook can duplicate an external action. The activity log records success, failure, or missing access without storing request bodies, headers, URLs, or response bodies.
+
+### ntfy quick setup
+
+Turn on Webhook, enter your ntfy server (default `https://ntfy.sh`) and topic, then click Use ntfy settings. This fills a POST request to the server root with valid JSON containing the topic, title and message. It selects Condition matched, Limit reached, Manually stopped and Error. It replaces URL/method/headers/body/events and leaves page details off; re-enter any Authorization header required by a private server after applying the preset. The setup button sends nothing and never grants access. Subscribe to the same topic and server in your ntfy app.
+
+Click Connect webhook to grant the hostname, then Send test notification to send one real request. A test uses event `test` and refreshCount `0`; it does not start or change monitoring, does not run custom scripts, and does not depend on your selected monitoring events. Duplicate test clicks are blocked while a test is in flight. HTTP success means the receiver accepted the request, not a guarantee that your phone displayed it. A timeout may occur after a receiver processed a request, so retry manually only when appropriate.
+
+If Connect fails after an unpacked extension update, open `chrome://extensions`, reload the extension card, reopen the popup and retry. Preserve the exact error message for troubleshooting if it still fails. An updated popup can be visible before the browser reloads new manifest declarations.
+
+[ntfy JSON publishing reference](https://docs.ntfy.sh/publish/#publish-as-json).
+
+### Pause while using the page
+
+Advanced settings includes Pause when I interact with the page. This is off by default. With it enabled, trusted clicking or typing in the monitored top-level page pauses the monitor; Resume continues manually. Programmatic clicks and synthetic keyboard events do not pause. Picker gestures are excluded. A pause during a slow before-refresh hook cancels the pending reload once the interaction is received; a navigation already issued by the browser cannot be undone. No typed text or keys are sent in interaction messages.
 
 ## Custom JavaScript
 
