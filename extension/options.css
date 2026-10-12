@@ -286,6 +286,19 @@ main.shell {
 .status-line.is-success { color: var(--teal-deep); font-weight: 600; }
 #monitor-status { margin-bottom: 12px; }
 
+/* Custom JavaScript stop condition: a code box, so keep it monospaced. */
+.code-input {
+  font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  min-height: 120px;
+  resize: vertical;
+  tab-size: 2;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
 .alert {
   margin-top: 14px;
   padding: 10px 12px;

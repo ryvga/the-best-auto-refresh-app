@@ -1,5 +1,42 @@
 # Validation
 
+## Version 1.3.2 — custom JavaScript stop condition
+
+Adds a new stop condition, `script-predicate`, for logic the built-in comparisons
+cannot express: the user writes the body of a function, it runs in the page after
+the settling delay on every cycle, and refreshing stops when it returns a truthy
+value. Failures are deliberately non-fatal — a predicate that throws, times out,
+is blocked by permissions, or reports anything other than a clean `true` continues
+the run and surfaces the reason. That is the flaky-content case the feature exists
+for, so a broken predicate can never end a session by accident.
+
+- 96 unit tests pass (80 before this change, 16 new in `tests/predicate.test.mjs`).
+- The new suite exercises four layers: the pure planner (`evaluateCondition`,
+  `planCycle`), the config validator (required code, 20,000-character ceiling,
+  trimming, and no effect on other conditions), the runner's
+  `{ ran, value, reason }` vocabulary across every failure path, and the generated
+  wrapper source itself, executed in Node exactly as written, to prove the boolean
+  contract, the frozen `context`, and the capped error message.
+- Non-stopping on failure is asserted directly: a `ran: false` predicate, a missing
+  predicate, and an over-budget snapshot all produce `continue`, and `planCycle`
+  returns `reload` rather than `matched` for a broken predicate with an elapsed
+  interval.
+- UI parity is asserted mechanically: both `popup.html`/`popup.js` and
+  `options.html`/`options.js` must offer the option, look up the panel and code
+  field, validate the field, and restore the saved code. The error node is named
+  `err-predicate-script` because field errors are addressed as `err-${fieldId}`;
+  that mismatch was caught and fixed during development.
+- Syntax, manifest and asset validation pass, and the package still contains only
+  extension files. `manifest.json` and `package.json` are at 1.3.2.
+
+Not verified in a real browser: that `chrome.userScripts.execute()` returns the
+wrapper's resolved value. The call shape, the isolated `USER_SCRIPT` world, and
+reading `result.ok` from the first injection result are the same code path the
+shipped page-scripts feature already uses, and `tests/predicate.test.mjs` pins that
+shape, but a real-browser run of the custom condition is still outstanding. The
+popup's new code box and access line have not been inspected in a browser either;
+only their wiring is covered by tests.
+
 ## Version 1.3.1 — supported Chrome range
 
 The manifest previously declared `minimum_chrome_version` 135, which excluded every

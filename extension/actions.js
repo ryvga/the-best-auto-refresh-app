@@ -28,6 +28,7 @@
  */
 
 import { describeWebhookUrl, normalizeActions, validateActions, permissionOriginForUrl } from './actions-core.js';
+import { MAX_PREDICATE_CONTEXT_CHARS, PREDICATE_TIMEOUT_MS } from './core.js';
 
 /** Whole-run budget: hooks must never hold a monitoring step open for longer. */
 export const RUN_ACTIONS_TIMEOUT_MS = 5000;
@@ -730,6 +731,169 @@ async function runScript({ record, event, action, snapshot, tabId, documentId, t
   // the isolated world and is never returned to the extension.
   if (first?.error || result?.ok !== true) return { outcome: 'failed' };
   return { outcome: 'ran' };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Custom stop conditions                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Wrap a user-authored condition as the body of a function that receives the
+ * check context and returns a boolean.
+ *
+ * The source runs as arbitrary code in the isolated USER_SCRIPT world, exactly
+ * like a page script, and never in an extension context. Unlike a page script it
+ * has to hand a value back, so the wrapper reports one boolean plus, on failure,
+ * one short message. Nothing else crosses back.
+ */
+function buildPredicateWrapper(code, context) {
+  const serialized = stringifyJson(context);
+  const literal = serialized === '' ? '{}' : serialized.replace(/<\//g, '<\\/');
+  return [
+    '(async function(){',
+    `  const __ctx = Object.freeze(${literal});`,
+    '  try {',
+    '    const __value = await (async function(context){',
+    String(code),
+    '\n    })(__ctx);',
+    '    return { ok: true, value: Boolean(__value) };',
+    '  } catch (error) {',
+    '    const message = error && error.message ? error.message : String(error);',
+    '    return { ok: false, message: String(message).slice(0, 200) };',
+    '  }',
+    '})();'
+  ].join('\n');
+}
+
+/** Pull one short, user-readable message out of whatever Chrome rejected with. */
+function readableError(error) {
+  if (!error) return '';
+  const message = typeof error.message === 'string' ? error.message : '';
+  return message.trim().slice(0, 200);
+}
+
+/** The read-only context handed to a custom condition on every check. */
+function buildPredicateContext(record, snapshot) {
+  const snap = snapshot && typeof snapshot === 'object' ? snapshot : {};
+  const text = typeof snap.text === 'string' ? snap.text : '';
+  const config = record && record.config && typeof record.config === 'object' ? record.config : {};
+  return {
+    url: typeof record.url === 'string' ? record.url : '',
+    title: typeof record.title === 'string' ? record.title : '',
+    refreshCount: Number.isFinite(record.refreshCount) ? record.refreshCount : 0,
+    checkCount: Number.isFinite(record.checkCount) ? record.checkCount : 0,
+    settleSeconds: Number.isFinite(config.settleSeconds) ? config.settleSeconds : 0,
+    selectorExists: snap.selectorExists === true,
+    text: text.slice(0, MAX_PREDICATE_CONTEXT_CHARS),
+    now: Date.now()
+  };
+}
+
+/**
+ * Evaluate a custom JavaScript stop condition for one check.
+ *
+ * Returns `{ ran, value, reason }`, which the caller attaches to the snapshot
+ * before the pure planner runs. Every failure path returns `ran:false` with a
+ * sentence rather than throwing, because a predicate that fails — page content
+ * that did not load, a blocked permission, an infinite loop — must continue the
+ * session instead of ending it.
+ */
+export async function evaluatePredicate({
+  record,
+  tabId,
+  documentId,
+  snapshot,
+  code,
+  timeoutMs = PREDICATE_TIMEOUT_MS
+}) {
+  if (typeof code !== 'string' || code.trim() === '') {
+    return { ran: false, value: false, reason: 'No custom condition is saved yet.' };
+  }
+
+  const api = safeProperty(chrome, 'userScripts');
+  if (!api || typeof api.execute !== 'function') {
+    return {
+      ran: false,
+      value: false,
+      reason: 'Custom conditions need the optional User Scripts permission. Chrome 138 and later also requires “Allow User Scripts” switched on in this extension’s Details page.'
+    };
+  }
+
+  const tab = await getTopTab(tabId);
+  const checkUrl = tab && typeof tab.url === 'string' && tab.url !== ''
+    ? tab.url
+    : (typeof record.url === 'string' ? record.url : '');
+  const access = await resolveUserScriptAccess(checkUrl);
+  if (access.permission !== true || access.originGranted !== true) {
+    return {
+      ran: false,
+      value: false,
+      reason: 'Custom conditions need JavaScript access granted for this website.'
+    };
+  }
+
+  const target = await resolveTargetDocument(record, tabId, documentId);
+  if (!target.ok) {
+    return {
+      ran: false,
+      value: false,
+      reason: target.reason === 'origin-changed'
+        ? 'The page changed origin before the custom condition could run.'
+        : 'The custom condition could not run on this page.'
+    };
+  }
+
+  const wrapper = buildPredicateWrapper(code, buildPredicateContext(record, snapshot));
+  let results = null;
+  let executionTimer = null;
+  try {
+    await api.configureWorld({ worldId: 'abra-monitor', messaging: false });
+    const executed = api.execute({
+      target: { tabId, documentIds: [target.documentId] },
+      world: 'USER_SCRIPT',
+      worldId: 'abra-monitor',
+      js: [{ code: wrapper }]
+    });
+    if (!executed || typeof executed.then !== 'function') {
+      return { ran: false, value: false, reason: 'The custom condition could not start.' };
+    }
+    results = await Promise.race([
+      executed,
+      new Promise((resolve) => { executionTimer = setTimeout(() => resolve('timed-out'), timeoutMs); })
+    ]);
+  } catch (error) {
+    // A syntax error in the user's own body fails the whole injection before the
+    // wrapper can catch it, so this is where a typo becomes visible.
+    const message = readableError(error);
+    return {
+      ran: false,
+      value: false,
+      reason: message
+        ? `Your custom condition could not run: ${message}`
+        : 'The custom condition could not run on this page.'
+    };
+  } finally {
+    if (executionTimer !== null) clearTimeout(executionTimer);
+  }
+  if (results === 'timed-out') {
+    return {
+      ran: false,
+      value: false,
+      reason: 'Your custom condition did not finish in time, so this check continued.'
+    };
+  }
+  const first = Array.isArray(results) ? results[0] : null;
+  const result = first && typeof first === 'object' ? first.result : null;
+  if (first?.error || !result || result.ok !== true) {
+    const message = readableError(first && first.error)
+      || (result && typeof result.message === 'string' ? result.message.trim().slice(0, 200) : '');
+    return {
+      ran: false,
+      value: false,
+      reason: message ? `Your custom condition raised: ${message}` : 'Your custom condition raised an error.'
+    };
+  }
+  return { ran: true, value: result.value === true, reason: null };
 }
 
 /* -------------------------------------------------------------------------- */

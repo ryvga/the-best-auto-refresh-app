@@ -68,6 +68,19 @@ export const MAX_REFRESH_LIMIT = 100000;
 export const MAX_MINUTES_LIMIT = 10080;
 export const MAX_KEYWORD_LENGTH = 500;
 export const MAX_SELECTOR_LENGTH = 1000;
+/**
+ * Upper bound for a custom JavaScript stop condition. Generous enough for real
+ * logic, small enough that a pasted file cannot be smuggled into the session
+ * record that already travels through storage and messaging.
+ */
+export const MAX_PREDICATE_LENGTH = 20000;
+/**
+ * A custom condition runs inside the page, so it is raced against this budget.
+ * A predicate that never settles must not be able to stall a refresh cycle.
+ */
+export const PREDICATE_TIMEOUT_MS = 3000;
+/** Budget for the page text handed to the predicate as `context.text`. */
+export const MAX_PREDICATE_CONTEXT_CHARS = 20000;
 /** Snapshot size cap (~200k chars) to keep chrome.storage.session small. */
 export const MAX_TEXT_SNAPSHOT = 200000;
 /** Element picker requests expire so a forgotten picker cannot be replayed. */
@@ -83,10 +96,13 @@ export const STOP_CONDITIONS = Object.freeze([
   'keyword-found',
   'keyword-missing',
   'element-found',
-  'element-missing'
+  'element-missing',
+  'script-predicate'
 ]);
 export const KEYWORD_CONDITIONS = Object.freeze(['keyword-found', 'keyword-missing']);
 export const SELECTOR_CONDITIONS = Object.freeze(['element-change', 'element-found', 'element-missing']);
+/** Conditions whose logic lives in user-authored JavaScript. */
+export const SCRIPT_CONDITIONS = Object.freeze(['script-predicate']);
 
 export const DEFAULT_CONFIG = Object.freeze({
   intervalMode: 'fixed',
@@ -96,6 +112,12 @@ export const DEFAULT_CONFIG = Object.freeze({
   stopCondition: 'never',
   keyword: '',
   selector: '',
+  /**
+   * Body of a JavaScript function used by the `script-predicate` condition. It
+   * runs in the page after the settle delay and stops the session when it
+   * returns a truthy value. Empty unless the user opts into that condition.
+   */
+  predicateScript: '',
   caseSensitive: false,
   wholeWord: false,
   settleSeconds: 2,
@@ -256,6 +278,24 @@ export function matchText(haystack, needle, options = {}) {
   return caseSensitive ? text.includes(term) : text.toLowerCase().includes(term.toLowerCase());
 }
 
+/**
+ * Normalise the outcome of a custom JavaScript condition.
+ *
+ * The value is produced by the extension's own runner, never by the page, and
+ * is reduced here to plain booleans and one short reason string so nothing else
+ * can travel back into the comparison pipeline with it.
+ */
+export function normalizePredicateResult(value) {
+  const source = value && typeof value === 'object' ? value : null;
+  const reason = source && typeof source.reason === 'string' && source.reason !== ''
+    ? source.reason.slice(0, 300)
+    : '';
+  if (!source || source.ran !== true) {
+    return { ran: false, value: false, reason: reason || 'A custom condition is not available for this page.' };
+  }
+  return { ran: true, value: source.value === true, reason: null };
+}
+
 /** Build the comparable snapshot object the page sends to the background. */
 export function normalizeSnapshot(snapshot) {
   const source = snapshot && typeof snapshot === 'object' ? snapshot : {};
@@ -267,7 +307,8 @@ export function normalizeSnapshot(snapshot) {
     url: typeof source.url === 'string' ? source.url : '',
     text: truncateText(normalizeWhitespace(rawText)).text,
     selectorText: truncateText(normalizeWhitespace(rawSelectorText)).text,
-    selectorExists: source.selectorExists === true
+    selectorExists: source.selectorExists === true,
+    predicate: normalizePredicateResult(source.predicate)
   };
 }
 
@@ -404,6 +445,10 @@ export function validateConfig(raw) {
     maxLength: MAX_SELECTOR_LENGTH,
     fallback: DEFAULT_CONFIG.ignoreSelector
   });
+  config.predicateScript = readStringField(input, 'predicateScript', errors, {
+    maxLength: MAX_PREDICATE_LENGTH,
+    fallback: DEFAULT_CONFIG.predicateScript
+  });
 
   config.caseSensitive = readBooleanField(input, 'caseSensitive', errors, DEFAULT_CONFIG.caseSensitive);
   config.wholeWord = readBooleanField(input, 'wholeWord', errors, DEFAULT_CONFIG.wholeWord);
@@ -440,6 +485,12 @@ export function validateConfig(raw) {
     errors.push({
       field: 'selector',
       message: 'A CSS selector is required for element stop conditions.'
+    });
+  }
+  if (SCRIPT_CONDITIONS.includes(config.stopCondition) && config.predicateScript === '') {
+    errors.push({
+      field: 'predicateScript',
+      message: 'A JavaScript condition is required for the custom stop condition.'
     });
   }
   if (config.selector !== '' && !looksLikeValidSelector(config.selector)) {
@@ -657,6 +708,27 @@ export function evaluateCondition({ baseline = null, current, config, now = Date
         return conditionResult('matched', 'The element matching the selector is gone.', base, keywordFound);
       }
       return conditionResult('continue', 'The element matching the selector is still present.', base, keywordFound);
+    }
+
+    case 'script-predicate': {
+      // The predicate itself ran in the page before this planner was called.
+      // Anything short of a clean `true` continues: a predicate that throws, is
+      // blocked by permissions, or never settles must not end a session by
+      // accident, which is exactly the flaky-content case this condition exists
+      // to handle.
+      const script = snap.predicate;
+      if (script.ran !== true) {
+        return conditionResult('continue', script.reason, base, keywordFound);
+      }
+      if (script.value === true) {
+        return conditionResult('matched', 'Your custom condition returned true.', base, keywordFound);
+      }
+      return conditionResult(
+        'continue',
+        script.reason || 'Your custom condition returned false.',
+        base,
+        keywordFound
+      );
     }
 
     default:

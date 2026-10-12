@@ -4,7 +4,7 @@ This is the operational checklist for publishing The Best Auto Refresh App to
 the Chrome Web Store. It splits the work into what this repository automates and
 what only the account owner can do in a browser.
 
-Current release: **1.3.1**. Store review and acceptance are decided by Google;
+Current release: **1.3.2**. Store review and acceptance are decided by Google;
 nothing here guarantees approval.
 
 ## What is automated vs. manual
@@ -52,7 +52,7 @@ node scripts/publish-cws.mjs upload --dry-run
 ## Step 3 — Create the item (first submission only)
 
 1. In the developer dashboard choose **Add new item**.
-2. Upload `dist/the-best-auto-refresh-app-1.3.1.zip`.
+2. Upload `dist/the-best-auto-refresh-app-1.3.2.zip`.
 3. Note the **extension ID** and the **publisher ID** shown in the dashboard.
    Both are needed later for automation.
 
@@ -66,9 +66,10 @@ text matches the extension's behaviour.
 Required assets:
 
 - **Store icon** — 128×128 PNG. Present at `extension/icons/icon128.png`.
-- **Screenshots** — 1280×800 or 640×400, up to five. **Not yet produced.** They
-  must show the real UI: the popup with an interval and stop condition, a stop
-  condition firing, and the dashboard. Do not mock up or embellish the UI.
+- **Screenshots** — 1280×800 or 640×400, up to five. Four are produced by
+  `node scripts/capture-store-assets.mjs` (popup running, stop conditions,
+  automation, dashboard) and written to the `store-assets` folder. They capture
+  the real UI. Do not mock up or embellish the UI.
 - **Privacy policy URL** — a stable public URL. See [Step 6](#step-6--publish-the-privacy-policy).
 - **Support URL** — the repository issue tracker works:
   <https://github.com/ryvga/the-best-auto-refresh-app/issues>
@@ -92,11 +93,20 @@ conditions that decide when refreshing stops.
 - `storage` — persists preferences and temporary per-tab monitoring state.
 - `alarms` — wakes the service worker for scheduling and watchdog checks.
 - `userScripts` (optional) — runs user-authored code for selected monitoring
-  events in the isolated `USER_SCRIPT` world, only after the user enables the
-  feature and Chrome's Allow User Scripts setting.
+  events and for the optional custom JavaScript stop condition, in the isolated
+  `USER_SCRIPT` world, only after the user enables the feature and Chrome's Allow
+  User Scripts setting.
 - Optional host permissions — connect user-configured HTTPS webhook endpoints or
   script websites, plus loopback HTTP for local development. Requested per host
   from an explicit user gesture, never all at once.
+
+**Remote code use.** Answer **No**. All executable code is bundled in the uploaded
+package, nothing is fetched at runtime, and no bundled file uses `eval` or
+`new Function`; a test enforces this. The only user-authored code is text the user
+types into the extension's own settings — optional page scripts and the optional
+custom stop condition — stored locally, never downloaded, and executed only
+through `chrome.userScripts.execute` in the isolated `USER_SCRIPT` world. The
+full wording is in [STORE.md](STORE.md#remote-code-use).
 
 **Data usage.** No developer collection, no analytics, no ads, no accounts. The
 extension transmits data only to endpoints the user configures. Disclose that

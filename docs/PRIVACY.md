@@ -14,6 +14,8 @@ Started settings remain independent per tab in temporary session storage. Openin
 
 Automation settings can include webhook addresses, custom headers, JSON body templates, and JavaScript code. These remain in local settings/profiles and temporary drafts. Local storage is not encrypted. The hook activity log is stored temporarily in browser session storage, contains generic outcomes rather than request/response bodies or code, and is capped at 100 entries.
 
+A custom JavaScript stop condition you write is stored the same way, as one more local setting. The stop reason it produces is a short message kept in the temporary session record and shown in the popup; it is never sent anywhere unless you enable a webhook that includes the stop reason.
+
 ## Permissions
 
 - **activeTab:** Temporary access to the tab you explicitly activate through the extension. It does not grant blanket access to all websites.

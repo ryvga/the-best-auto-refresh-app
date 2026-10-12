@@ -885,6 +885,19 @@ select.input {
 .status-line.is-error { color: var(--danger-deep); font-weight: 600; }
 .status-line:empty { min-height: 0; }
 
+/* Custom JavaScript stop condition: a code box, so keep it monospaced. */
+.code-input {
+  font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  min-height: 104px;
+  resize: vertical;
+  tab-size: 2;
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
 /* activity log */
 
 .activity {

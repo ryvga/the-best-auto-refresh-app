@@ -60,10 +60,13 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     'keyword-found',
     'keyword-missing',
     'element-found',
-    'element-missing'
+    'element-missing',
+    'script-predicate'
   ]);
   const KEYWORD_CONDITIONS = new Set(['keyword-found', 'keyword-missing']);
   const SELECTOR_CONDITIONS = new Set(['element-change', 'element-found', 'element-missing']);
+  const SCRIPT_CONDITIONS = new Set(['script-predicate']);
+  const MAX_PREDICATE_LENGTH = 20000;
 
   const STATUS_TEXT = {
     idle: 'Idle',
@@ -81,7 +84,8 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     'keyword-found': 'keyword appears',
     'keyword-missing': 'keyword disappears',
     'element-found': 'element appears',
-    'element-missing': 'element disappears'
+    'element-missing': 'element disappears',
+    'script-predicate': 'your JavaScript condition is true'
   };
 
   const VALIDATED_FIELDS = [
@@ -93,6 +97,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     'max-minutes',
     'keyword',
     'selector',
+    'predicate-script',
     'ignore-selector'
   ];
 
@@ -147,6 +152,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     'defaults-form', 'custom-panel', 'fixed-field', 'random-fields',
     'interval-seconds', 'min-seconds', 'max-seconds', 'stop-condition',
     'keyword-panel', 'keyword', 'selector-panel', 'selector',
+    'predicate-panel', 'predicate-script', 'predicate-access',
     'settle-seconds', 'max-refreshes', 'max-minutes', 'ignore-selector',
     'case-sensitive', 'whole-word', 'preserve-scroll', 'bypass-cache',
     'pause-when-hidden', 'pause-on-interaction', 'defaults-alert', 'defaults-note', 'save-defaults',
@@ -566,6 +572,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
       : DEFAULT_CONFIG.stopCondition;
     const keyword = ui.keyword.value.trim();
     const selector = ui.selector.value.trim();
+    const predicateScript = ui['predicate-script'].value.trim();
     const ignoreSelector = ui['ignore-selector'].value.trim();
 
     if (KEYWORD_CONDITIONS.has(stopCondition) && keyword === '') {
@@ -573,6 +580,12 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     }
     if (SELECTOR_CONDITIONS.has(stopCondition) && selector === '') {
       errors.push({ id: 'selector', message: 'Add a CSS selector. You can pick one in the popup.' });
+    }
+    if (SCRIPT_CONDITIONS.has(stopCondition) && predicateScript === '') {
+      errors.push({ id: 'predicate-script', message: 'Write the condition, or pick a different way to stop.' });
+    }
+    if (predicateScript.length > MAX_PREDICATE_LENGTH) {
+      errors.push({ id: 'predicate-script', message: `Keep the condition under ${MAX_PREDICATE_LENGTH} characters.` });
     }
     if (selector !== '' && !isValidCssSelector(selector)) {
       errors.push({ id: 'selector', message: 'That does not look like a valid CSS selector.' });
@@ -598,6 +611,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
       stopCondition,
       keyword,
       selector,
+      predicateScript,
       caseSensitive: ui['case-sensitive'].checked,
       wholeWord: ui['whole-word'].checked,
       settleSeconds: settleSeconds === null ? DEFAULT_CONFIG.settleSeconds : settleSeconds,
@@ -632,6 +646,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     ui['stop-condition'].value = config.stopCondition;
     ui.keyword.value = config.keyword;
     ui.selector.value = config.selector;
+    ui['predicate-script'].value = config.predicateScript;
     ui['case-sensitive'].checked = config.caseSensitive;
     ui['whole-word'].checked = config.wholeWord;
     el('settle-seconds').value = String(config.settleSeconds);
@@ -657,6 +672,41 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     const condition = ui['stop-condition'].value;
     ui['keyword-panel'].hidden = !KEYWORD_CONDITIONS.has(condition);
     ui['selector-panel'].hidden = !SELECTOR_CONDITIONS.has(condition);
+    ui['predicate-panel'].hidden = !SCRIPT_CONDITIONS.has(condition);
+    void refreshPredicateAccess(condition);
+  }
+
+  /**
+   * Say up front whether a custom condition can run in this browser, instead of
+   * letting every check report the same blocked reason.
+   */
+  async function refreshPredicateAccess(condition) {
+    const node = ui['predicate-access'];
+    if (!node) return;
+    if (!SCRIPT_CONDITIONS.has(condition)) {
+      node.hidden = true;
+      return;
+    }
+    node.hidden = false;
+    const hasChrome = typeof chrome !== 'undefined' && chrome !== null;
+    const api = hasChrome ? chrome.userScripts : undefined;
+    let granted = false;
+    if (hasChrome && chrome.permissions && typeof chrome.permissions.contains === 'function') {
+      try {
+        granted = (await chrome.permissions.contains({ permissions: ['userScripts'] })) === true;
+      } catch {
+        granted = false;
+      }
+    }
+    const text = !hasChrome || !chrome.permissions
+      ? 'This browser build does not expose chrome.permissions, so JavaScript access cannot be checked here.'
+      : !granted
+        ? 'JavaScript access is not granted yet. Enable it for a site from the popup, or Chrome keeps refreshing without stopping.'
+        : (!api || typeof api.execute !== 'function')
+          ? 'Access is granted, but “Allow User Scripts” is off. Turn it on in this extension’s Details page, then reload the extension.'
+          : 'JavaScript access is ready. The condition runs in the page after every settle.';
+    node.className = 'status-line' + (granted && api && typeof api.execute === 'function' ? ' is-success' : ' is-error');
+    node.textContent = text;
   }
 
   // ---------------------------------------------------------- monitored tabs

@@ -111,7 +111,14 @@ test('normalizeSnapshot keeps only the comparable fields', () => {
     text: 'hello world',
     selectorText: '',
     selectorExists: false,
-    url: 'https://example.com/'
+    url: 'https://example.com/',
+    // A snapshot that never carried a predicate reads as "did not run", so the
+    // planner continues instead of stopping on a missing result.
+    predicate: {
+      ran: false,
+      value: false,
+      reason: 'A custom condition is not available for this page.'
+    }
   });
 });
 
@@ -841,7 +848,8 @@ test('the runtime message contract is exactly the documented set', () => {
     'keyword-found',
     'keyword-missing',
     'element-found',
-    'element-missing'
+    'element-missing',
+    'script-predicate'
   ]);
 });
 
@@ -860,6 +868,7 @@ test('the default config keeps the exact keys and values the UI sends', () => {
     'minSeconds',
     'pauseOnInteraction',
     'pauseWhenHidden',
+    'predicateScript',
     'preserveScroll',
     'selector',
     'settleSeconds',

@@ -8,6 +8,7 @@ No account. No ads. No paywalls. No analytics. Monitoring happens on your device
 
 - Fixed intervals or random intervals within a range.
 - Stop on page text changes, changes to a chosen element, a keyword appearing or disappearing, or an element appearing or disappearing.
+- Write your own JavaScript stop condition for anything the presets miss: return a truthy value to stop, and the check runs after the settling delay on every cycle.
 - Scope keyword checks to a CSS selector; case-sensitive and whole-word matching.
 - Point-and-click element picker; ignore noisy areas with a CSS selector.
 - Set a maximum refresh count or duration, pause/resume, preserve scroll, or bypass the cache.
@@ -35,6 +36,22 @@ Keep the extension directory in place. After pulling an update, click Reload on 
 ## How it works
 
 Page text monitoring compares normalized visible text against the initial baseline. Dynamic clocks, ads, and counters can trigger page-change detection; use a selected element or ignored selector to narrow the watch. A keyword already matching your condition can stop immediately after the settling delay.
+
+### Custom JavaScript stop condition
+
+Choose **My JavaScript condition returns true** and write the body of a function. It runs in the page after the settling delay, on every cycle, and refreshing stops when it returns a truthy value. Anything else — `false`, `0`, an empty string, `null`, `undefined` — keeps refreshing.
+
+```js
+// Stop when the price appears and drops below 100.
+const node = document.querySelector('.price');
+if (!node) return false;          // content has not loaded yet: keep going
+const value = parseFloat(node.textContent.replace(/[^0-9.]/g, ''));
+return Number.isFinite(value) && value < 100;
+```
+
+The condition receives a read-only `context`: `url`, `title`, `text` (normalized visible page text, capped), `refreshCount`, `checkCount`, `settleSeconds`, `selectorExists`, and `now`. It can query and observe the DOM, or `await` asynchronous work.
+
+Failures never end a run. If the code throws, returns nothing useful, cannot finish within three seconds, or JavaScript access is not granted, the check reports why and refreshing continues — so a page that sometimes fails to load keeps being retried instead of stopping early. Because this is arbitrary code, it needs the optional `userScripts` permission and, on Chrome 138 and later, Chrome's own **Allow User Scripts** setting for the site; the popup tells you when either is missing.
 
 Monitoring requires an open tab and running browser. Background tabs, browser suspension, and computer sleep can delay checks; this is not an exact timing service. Refreshing reloads the page, so save any form edits first. Browser-internal pages, the Chrome Web Store, other extensions, and inaccessible frames cannot be monitored. Same-origin reloads retain the user-granted access; moving to another origin ends monitoring. Browser restart clears active sessions rather than silently restarting them.
 

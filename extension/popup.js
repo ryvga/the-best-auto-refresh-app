@@ -87,6 +87,8 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     stopCondition: 'never',
     keyword: '',
     selector: '',
+    /** Body of the user's JavaScript condition for the `script-predicate` stop. */
+    predicateScript: '',
     caseSensitive: false,
     wholeWord: false,
     settleSeconds: 2,
@@ -109,11 +111,14 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     'keyword-found',
     'keyword-missing',
     'element-found',
-    'element-missing'
+    'element-missing',
+    'script-predicate'
   ]);
   const STOP_CONDITION_SET = new Set(STOP_CONDITIONS);
   const KEYWORD_CONDITIONS = new Set(['keyword-found', 'keyword-missing']);
   const SELECTOR_CONDITIONS = new Set(['element-change', 'element-found', 'element-missing']);
+  const SCRIPT_CONDITIONS = new Set(['script-predicate']);
+  const MAX_PREDICATE_LENGTH = 20000;
 
   const STATUS_TEXT = {
     idle: 'Idle',
@@ -134,6 +139,7 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     'max-minutes',
     'keyword',
     'selector',
+    'predicate-script',
     'ignore-selector',
     // Automation errors are reported through the same field machinery. Each id
     // below has a matching #err-<id> node in the Automation disclosure.
@@ -163,6 +169,9 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
   const DRAFT_TEXT_FIELDS = [
     'interval-seconds', 'min-seconds', 'max-seconds', 'settle-seconds',
     'max-refreshes', 'max-minutes', 'keyword', 'selector', 'ignore-selector',
+    // The custom condition is raw user code: a half-typed predicate comes back
+    // exactly as it was left, whitespace and all.
+    'predicate-script',
     // Raw ntfy quick-setup text: a half-typed topic or server comes back exactly
     // as it was left, invalid characters included. These are draft-only fields;
     // they are never part of the stored settings schema.
@@ -235,6 +244,7 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     'controls', 'custom-panel', 'fixed-field', 'random-fields',
     'interval-seconds', 'min-seconds', 'max-seconds', 'stop-condition',
     'keyword-panel', 'keyword', 'selector-panel', 'selector', 'pick-element',
+    'predicate-panel', 'predicate-script', 'predicate-access',
     'advanced', 'settle-seconds', 'max-refreshes', 'max-minutes',
     'ignore-selector', 'case-sensitive', 'whole-word', 'preserve-scroll',
     'bypass-cache', 'pause-when-hidden', 'pause-on-interaction', 'form-alert', 'primary-action',
@@ -1184,6 +1194,8 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
         return `It stops when ${selector} appears.`;
       case 'element-missing':
         return `It stops when ${selector} disappears.`;
+      case 'script-predicate':
+        return 'It stops when your JavaScript condition returns true.';
       default:
         return 'It keeps refreshing until you stop it.';
     }
@@ -1487,6 +1499,7 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
       : DEFAULT_CONFIG.stopCondition;
     const keyword = ui.keyword.value.trim();
     const selector = ui.selector.value.trim();
+    const predicateScript = ui['predicate-script'].value.trim();
     const ignoreSelector = ui['ignore-selector'].value.trim();
 
     if (KEYWORD_CONDITIONS.has(stopCondition) && keyword === '') {
@@ -1494,6 +1507,18 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     }
     if (SELECTOR_CONDITIONS.has(stopCondition) && selector === '') {
       errors.push({ id: 'selector', message: 'Add a CSS selector, or use Pick element.' });
+    }
+    if (SCRIPT_CONDITIONS.has(stopCondition) && predicateScript === '') {
+      errors.push({
+        id: 'predicate-script',
+        message: 'Write the condition, or pick a different way to stop.'
+      });
+    }
+    if (predicateScript.length > MAX_PREDICATE_LENGTH) {
+      errors.push({
+        id: 'predicate-script',
+        message: `Keep the condition under ${MAX_PREDICATE_LENGTH} characters.`
+      });
     }
     if (selector !== '' && !isValidCssSelector(selector)) {
       errors.push({ id: 'selector', message: 'That does not look like a valid CSS selector.' });
@@ -1552,6 +1577,7 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
       stopCondition,
       keyword,
       selector,
+      predicateScript,
       caseSensitive: ui['case-sensitive'].checked,
       wholeWord: ui['whole-word'].checked,
       settleSeconds: settleSeconds === null ? DEFAULT_CONFIG.settleSeconds : settleSeconds,
@@ -1583,6 +1609,7 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     ui['stop-condition'].value = config.stopCondition;
     ui.keyword.value = config.keyword;
     ui.selector.value = config.selector;
+    ui['predicate-script'].value = config.predicateScript;
     ui['case-sensitive'].checked = config.caseSensitive;
     ui['whole-word'].checked = config.wholeWord;
     el('settle-seconds').value = String(config.settleSeconds);
@@ -1611,6 +1638,41 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     const condition = ui['stop-condition'].value;
     ui['keyword-panel'].hidden = !KEYWORD_CONDITIONS.has(condition);
     ui['selector-panel'].hidden = !SELECTOR_CONDITIONS.has(condition);
+    ui['predicate-panel'].hidden = !SCRIPT_CONDITIONS.has(condition);
+    void refreshPredicateAccess(condition);
+  }
+
+  /**
+   * Say up front whether a custom condition can actually run here, instead of
+   * letting every single check report the same blocked reason.
+   */
+  async function refreshPredicateAccess(condition) {
+    const node = ui['predicate-access'];
+    if (!node) return;
+    if (!SCRIPT_CONDITIONS.has(condition)) {
+      node.hidden = true;
+      return;
+    }
+    node.hidden = false;
+    const hasChrome = typeof chrome !== 'undefined' && chrome !== null;
+    const api = hasChrome ? chrome.userScripts : undefined;
+    let granted = false;
+    if (hasChrome && chrome.permissions && typeof chrome.permissions.contains === 'function') {
+      try {
+        granted = (await chrome.permissions.contains({ permissions: ['userScripts'] })) === true;
+      } catch {
+        granted = false;
+      }
+    }
+    if (!hasChrome || !chrome.permissions) {
+      setStatusLine(node, 'This browser build does not expose chrome.permissions, so JavaScript access cannot be checked here.', 'is-error');
+    } else if (!granted) {
+      setStatusLine(node, 'JavaScript access is not granted for this website yet. Until it is, refreshing continues and this condition never stops it.', 'is-error');
+    } else if (!api || typeof api.execute !== 'function') {
+      setStatusLine(node, 'Access is granted, but “Allow User Scripts” is off. Turn it on in this extension’s Details page, then reload the extension.', 'is-error');
+    } else {
+      setStatusLine(node, 'JavaScript access is ready, so this condition can run after every settle.', 'is-success');
+    }
   }
 
   // -------------------------------------------------------------- automation

@@ -59,7 +59,7 @@ import {
   watchdogDelayMs,
   withDefaults
 } from './core.js';
-import { runActions, getActionCapabilities, getActionLog, testWebhook } from './actions.js';
+import { runActions, getActionCapabilities, getActionLog, testWebhook, evaluatePredicate } from './actions.js';
 
 const SESSION_KEY = 'abraSessions';
 const PICKED_KEY = 'pickedSelector';
@@ -577,6 +577,25 @@ async function runCheck(record, msg) {
   // A page action may navigate. Leave navigation recovery to onUpdated and
   // never apply a snapshot or reload decision to its replacement document.
   if (!await isCurrentDocument(record)) return { ok: true, action: 'wait' };
+
+  // A custom JavaScript condition runs here, after the page reported its settled
+  // snapshot, so it sees the same content the planner is about to judge. Its
+  // boolean is attached to the snapshot and every matching decision stays in the
+  // pure planner below. The runner never throws and never ends a session: a
+  // predicate that errors, is blocked, or never settles simply reports why and
+  // the refresh cycle continues.
+  record.checkCount = (Number.isFinite(record.checkCount) ? record.checkCount : 0) + 1;
+  if (record.config && record.config.stopCondition === 'script-predicate') {
+    snapshot.predicate = await evaluatePredicate({
+      record,
+      tabId: record.tabId,
+      documentId: record.documentId,
+      snapshot,
+      code: record.config.predicateScript
+    });
+    if (sessions.get(record.tabId) !== record || record.status !== 'running'
+        || !await isCurrentDocument(record)) return { ok: true, action: 'wait' };
+  }
 
   // core.planCycle owns every matching/timing decision; this file only applies
   // the chrome side effects (storage, badge, alarms, page messages).
