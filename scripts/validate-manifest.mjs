@@ -1,0 +1,14 @@
+import assert from 'node:assert/strict';
+import {readFile, access} from 'node:fs/promises';
+const root = new URL('../extension/', import.meta.url);
+const manifest = JSON.parse((await readFile(new URL('manifest.json', root), 'utf8')).replace(/^\uFEFF/, ''));
+assert.equal(manifest.manifest_version, 3);
+assert.equal(manifest.name, 'The Best Auto Refresh App');
+assert.ok(manifest.description.length <= 132);
+assert.deepEqual([...manifest.permissions].sort(), ['activeTab', 'alarms', 'scripting', 'storage']);
+assert.equal(manifest.host_permissions?.length || 0, 0);
+assert.equal(manifest.background.type, 'module');
+assert.ok(!manifest.content_security_policy?.extension_pages?.includes('https:'));
+const paths = [manifest.background.service_worker, manifest.action.default_popup, manifest.options_page || manifest.options_ui?.page, ...Object.values(manifest.icons), ...Object.values(manifest.action.default_icon || {})];
+for (const path of paths.filter(Boolean)) await access(new URL(path, root));
+console.log('Manifest, least-privilege permissions, and referenced assets validated.');

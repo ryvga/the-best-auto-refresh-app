@@ -1,0 +1,20 @@
+name: Checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+      - name: Check JavaScript syntax
+        run: |
+          for file in extension/*.js; do node --check "$file"; done
+      - name: Validate package manifest and assets
+        run: node scripts/validate-manifest.mjs

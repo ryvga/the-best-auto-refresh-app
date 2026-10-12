@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Dashboard — The Best Auto Refresh App</title>
+<link rel="stylesheet" href="options.css">
+</head>
+<body class="options">
+
+<a class="skip-link" href="#monitor">Skip to monitored tabs</a>
+
+<div class="banner-page" id="preview-banner" role="note" hidden>
+  <span class="banner-tag">Preview</span>
+  <span id="preview-banner-text">The extension engine is not reachable from this page, so nothing here will refresh. This is a layout preview.</span>
+</div>
+
+<header class="topbar">
+  <div class="shell topbar-inner">
+    <span class="brand">
+      <span class="brand-mark" aria-hidden="true">
+        <img id="brand-icon" src="icons/icon48.png" alt="" width="40" height="40" decoding="async">
+        <svg id="brand-fallback" class="brand-fallback" viewBox="0 0 32 32" width="40" height="40" hidden>
+          <rect x="0" y="0" width="32" height="32" rx="9" fill="#102A2D"></rect>
+          <path d="M24.5 16a8.5 8.5 0 1 1-2.6-6.1" fill="none" stroke="#32D5B0" stroke-width="3" stroke-linecap="round"></path>
+          <path d="M16 11.4l1.5 3.1 3.1 1.5-3.1 1.5-1.5 3.1-1.5-3.1-3.1-1.5 3.1-1.5z" fill="#ffffff"></path>
+        </svg>
+      </span>
+      <span class="brand-copy">
+        <span class="brand-title">The Best Auto Refresh App</span>
+        <span class="brand-tagline">Refresh smarter. Stop when it matters.</span>
+      </span>
+    </span>
+
+    <nav class="nav" aria-label="Page sections">
+      <a href="#monitor">Monitored tabs</a>
+      <a href="#defaults">Default settings</a>
+      <a href="#profiles">Profiles</a>
+      <a href="#help">Help</a>
+      <a href="#privacy">Privacy</a>
+    </nav>
+  </div>
+</header>
+
+<main class="shell">
+
+  <p class="lede">
+    One calm place to watch every refreshing tab, tune your defaults, and keep reusable profiles.
+    Everything runs on your device &mdash; free and complete, with no paid tier.
+  </p>
+
+  <!-- ------------------------------------------------------ monitored tabs -->
+  <section class="section" id="monitor" aria-labelledby="monitor-heading">
+    <div class="section-head">
+      <div>
+        <h2 id="monitor-heading">Monitored tabs</h2>
+        <p class="section-note">Live state for every tab this extension is refreshing. Updates every two seconds while this page is visible.</p>
+      </div>
+      <div class="section-actions">
+        <button class="btn btn-secondary" type="button" id="refresh-sessions">Refresh list</button>
+        <button class="btn btn-danger-quiet" type="button" id="stop-all-tabs">Stop all</button>
+      </div>
+    </div>
+
+    <p class="status-line" id="monitor-status" role="status" aria-live="polite">Loading monitored tabs&hellip;</p>
+
+    <div class="table-wrap">
+      <table class="table" id="sessions-table">
+        <caption class="sr-only">Tabs currently being refreshed, with their status and available actions</caption>
+        <thead>
+          <tr>
+            <th scope="col">Tab</th>
+            <th scope="col">Status</th>
+            <th scope="col">Refreshes</th>
+            <th scope="col">Next refresh</th>
+            <th scope="col"><span class="sr-only">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody id="sessions-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- --------------------------------------------------------- defaults -->
+  <section class="section" id="defaults" aria-labelledby="defaults-heading">
+    <div class="section-head">
+      <div>
+        <h2 id="defaults-heading">Default settings</h2>
+        <p class="section-note">The popup starts from these values. Pressing Start in the popup also saves them as your defaults.</p>
+      </div>
+    </div>
+
+    <form class="form" id="defaults-form" novalidate>
+
+      <div class="grid-2">
+        <fieldset class="field">
+          <legend class="field-label">Refresh every</legend>
+          <div class="segmented">
+            <input class="seg-input" type="radio" name="intervalPreset" id="preset-10" value="10">
+            <label class="seg-label" for="preset-10">10 seconds</label>
+
+            <input class="seg-input" type="radio" name="intervalPreset" id="preset-30" value="30">
+            <label class="seg-label" for="preset-30">30 seconds</label>
+
+            <input class="seg-input" type="radio" name="intervalPreset" id="preset-60" value="60">
+            <label class="seg-label" for="preset-60">60 seconds</label>
+
+            <input class="seg-input" type="radio" name="intervalPreset" id="preset-custom" value="custom">
+            <label class="seg-label" for="preset-custom">Custom</label>
+          </div>
+        </fieldset>
+
+        <div class="field" id="custom-panel" hidden>
+          <span class="field-label" id="custom-mode-label">Custom timing</span>
+          <div class="segmented segmented-2" role="group" aria-labelledby="custom-mode-label">
+            <input class="seg-input" type="radio" name="intervalMode" id="mode-fixed" value="fixed">
+            <label class="seg-label" for="mode-fixed">Fixed</label>
+
+            <input class="seg-input" type="radio" name="intervalMode" id="mode-random" value="random">
+            <label class="seg-label" for="mode-random">Random range</label>
+          </div>
+
+          <div class="field" id="fixed-field">
+            <label class="field-label" for="interval-seconds">Seconds between refreshes</label>
+            <input class="input input-number" type="number" id="interval-seconds" inputmode="numeric" min="5" step="1" value="30"
+                   aria-describedby="hint-interval-seconds err-interval-seconds">
+            <p class="hint" id="hint-interval-seconds">The shortest allowed interval is 5 seconds.</p>
+            <p class="field-error" id="err-interval-seconds" hidden></p>
+          </div>
+
+          <div class="field-row" id="random-fields">
+            <div class="field">
+              <label class="field-label" for="min-seconds">Shortest wait (seconds)</label>
+              <input class="input input-number" type="number" id="min-seconds" inputmode="numeric" min="5" step="1" value="20"
+                     aria-describedby="err-min-seconds">
+              <p class="field-error" id="err-min-seconds" hidden></p>
+            </div>
+            <div class="field">
+              <label class="field-label" for="max-seconds">Longest wait (seconds)</label>
+              <input class="input input-number" type="number" id="max-seconds" inputmode="numeric" min="5" step="1" value="60"
+                     aria-describedby="err-max-seconds">
+              <p class="field-error" id="err-max-seconds" hidden></p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="field">
+        <label class="field-label" for="stop-condition">Stop when</label>
+        <select class="input" id="stop-condition" aria-describedby="hint-stop-condition">
+          <option value="never">Never &mdash; keep refreshing until I stop it</option>
+          <option value="page-change">The page text changes</option>
+          <option value="element-change">A watched element changes</option>
+          <option value="keyword-found">A keyword appears</option>
+          <option value="keyword-missing">A keyword disappears</option>
+          <option value="element-found">An element appears</option>
+          <option value="element-missing">An element disappears</option>
+        </select>
+        <p class="hint" id="hint-stop-condition">Refreshing continues while the condition is unmet, then stops and records why.</p>
+      </div>
+
+      <div class="field" id="keyword-panel" hidden>
+        <label class="field-label" for="keyword">Keyword to watch for</label>
+        <input class="input" type="text" id="keyword" autocomplete="off" spellcheck="false"
+               placeholder="e.g. In stock" aria-describedby="hint-keyword err-keyword" maxlength="500">
+        <p class="hint" id="hint-keyword">The keyword check reads the visible text of the page, unless you scope it to an element below.</p>
+        <p class="field-error" id="err-keyword" hidden></p>
+      </div>
+
+      <div class="field" id="selector-panel" hidden>
+        <label class="field-label" for="selector">Element selector (CSS)</label>
+        <input class="input" type="text" id="selector" autocomplete="off" spellcheck="false"
+               placeholder="e.g. #order-status" aria-describedby="hint-selector err-selector" maxlength="1000">
+        <p class="hint" id="hint-selector">Point-and-click picking happens in the popup, where it can act on the tab you are looking at.</p>
+        <p class="field-error" id="err-selector" hidden></p>
+      </div>
+
+      <div class="panel">
+        <h3 class="panel-title">Advanced settings</h3>
+        <div class="grid-2">
+          <div class="field">
+            <label class="field-label" for="settle-seconds">Settle time (seconds)</label>
+            <input class="input input-number" type="number" id="settle-seconds" inputmode="decimal" min="0" max="60" step="0.5" value="2"
+                   aria-describedby="hint-settle-seconds err-settle-seconds">
+            <p class="hint" id="hint-settle-seconds">How long to wait after a page load before checking it.</p>
+            <p class="field-error" id="err-settle-seconds" hidden></p>
+          </div>
+          <div class="field">
+            <label class="field-label" for="ignore-selector">Ignore changes inside (CSS)</label>
+            <input class="input" type="text" id="ignore-selector" autocomplete="off" spellcheck="false"
+                   placeholder="e.g. .live-clock" aria-describedby="hint-ignore-selector err-ignore-selector" maxlength="1000">
+            <p class="hint" id="hint-ignore-selector">Clocks, ads, and counters belong here so they do not trigger page-change stops.</p>
+            <p class="field-error" id="err-ignore-selector" hidden></p>
+          </div>
+          <div class="field">
+            <label class="field-label" for="max-refreshes">Maximum refreshes (0 = unlimited)</label>
+            <input class="input input-number" type="number" id="max-refreshes" inputmode="numeric" min="0" step="1" value="0"
+                   aria-describedby="err-max-refreshes">
+            <p class="field-error" id="err-max-refreshes" hidden></p>
+          </div>
+          <div class="field">
+            <label class="field-label" for="max-minutes">Maximum minutes (0 = unlimited)</label>
+            <input class="input input-number" type="number" id="max-minutes" inputmode="decimal" min="0" step="1" value="0"
+                   aria-describedby="err-max-minutes">
+            <p class="field-error" id="err-max-minutes" hidden></p>
+          </div>
+        </div>
+
+        <div class="grid-3">
+          <fieldset class="field">
+            <legend class="field-label">Keyword matching</legend>
+            <label class="check" for="case-sensitive">
+              <input type="checkbox" id="case-sensitive">
+              <span>Match letter case exactly</span>
+            </label>
+            <label class="check" for="whole-word">
+              <input type="checkbox" id="whole-word">
+              <span>Match whole word only</span>
+            </label>
+          </fieldset>
+
+          <fieldset class="field">
+            <legend class="field-label">While refreshing</legend>
+            <label class="check" for="preserve-scroll">
+              <input type="checkbox" id="preserve-scroll" checked>
+              <span>Keep my scroll position</span>
+            </label>
+            <label class="check" for="bypass-cache">
+              <input type="checkbox" id="bypass-cache">
+              <span>Reload without the browser cache</span>
+            </label>
+            <label class="check" for="pause-when-hidden">
+              <input type="checkbox" id="pause-when-hidden">
+              <span>Pause while the tab is in the background</span>
+            </label>
+          </fieldset>
+
+          <div class="field">
+            <span class="field-label">Timing expectations</span>
+            <p class="hint">
+              Refreshing is best-effort. Background tabs, a suspended browser, and computer sleep can all delay a check.
+              This is a watcher, not an exact stopwatch.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <p class="alert" id="defaults-alert" role="alert" hidden></p>
+
+      <div class="form-actions">
+        <button class="btn btn-primary" type="submit" id="save-defaults">Save defaults</button>
+        <button class="btn btn-quiet" type="button" id="reset-defaults">Reset to built-in defaults</button>
+        <span class="status-line" id="defaults-note" role="status" aria-live="polite"></span>
+      </div>
+    </form>
+  </section>
+
+  <!-- --------------------------------------------------------- profiles -->
+  <section class="section" id="profiles" aria-labelledby="profiles-heading">
+    <div class="section-head">
+      <div>
+        <h2 id="profiles-heading">Profiles</h2>
+        <p class="section-note">Save the settings above as a named profile, then load it whenever you need that setup again. Profiles live in local extension storage on this device.</p>
+      </div>
+    </div>
+
+    <div class="profile-form">
+      <div class="field">
+        <label class="field-label" for="profile-name">Profile name</label>
+        <input class="input" type="text" id="profile-name" autocomplete="off" maxlength="60"
+               placeholder="e.g. Ticket queue watch" aria-describedby="hint-profile-name">
+        <p class="hint" id="hint-profile-name">Saved profiles keep the interval, stop condition, and advanced settings.</p>
+      </div>
+      <button class="btn btn-secondary" type="button" id="save-profile">Save current settings as profile</button>
+      <span class="status-line" id="profiles-note" role="status" aria-live="polite"></span>
+    </div>
+
+    <p class="alert" id="profiles-alert" role="alert" hidden></p>
+
+    <ul class="profiles" id="profiles-list" aria-label="Saved profiles"></ul>
+  </section>
+
+  <!-- ------------------------------------------------------------- help -->
+  <div class="split">
+    <section class="section" id="help" aria-labelledby="help-heading">
+      <div class="section-head">
+        <div>
+          <h2 id="help-heading">Help</h2>
+          <p class="section-note">Short answers, kept honest.</p>
+        </div>
+      </div>
+
+      <h3 class="subhead">How monitoring works</h3>
+      <ul class="bullets">
+        <li>Pick an interval &mdash; steady, or a random wait between a shortest and longest value.</li>
+        <li>Pick a stop condition. Refreshing continues while the condition is unmet.</li>
+        <li>Page text comparisons ignore the areas you name in <em>Ignore changes inside</em>, which keeps clocks and ads from stopping your watch.</li>
+        <li>A limit of 0 refreshes or 0 minutes means no limit at all.</li>
+        <li>Preserve scroll keeps your reading position; bypass cache asks the site to reload without cached files.</li>
+      </ul>
+
+      <h3 class="subhead">Keyboard and focus</h3>
+      <ul class="bullets">
+        <li>Tab and Shift+Tab move through the popup in reading order; every control has a visible focus ring.</li>
+        <li>Give each radio button or checkbox focus and press Space to choose it; press Enter in a text field to start.</li>
+        <li>Element picking closes the popup so you can click the page. Reopen the popup and the selector is filled in.</li>
+      </ul>
+
+      <h3 class="subhead">When something does not work</h3>
+      <ul class="bullets">
+        <li>Browser-internal pages (<code>chrome://</code>), the Chrome Web Store, other extensions, and pages you cannot script cannot be refreshed.</li>
+        <li>Refreshing reloads the page, so unsaved form edits are lost. Save your work first.</li>
+        <li>Sessions do not survive a browser restart; they are cleared rather than silently resumed.</li>
+        <li>A changed origin ends monitoring, because access is granted per tab and site.</li>
+      </ul>
+
+      <h3 class="subhead">Permissions in plain words</h3>
+      <ul class="bullets">
+        <li><strong>activeTab</strong> &mdash; temporary access to the tab you start, not to every site you visit.</li>
+        <li><strong>scripting</strong> &mdash; adds the local monitoring script and element picker to that tab.</li>
+        <li><strong>storage</strong> &mdash; keeps your settings, profiles, and temporary session state.</li>
+        <li><strong>alarms</strong> &mdash; wakes the extension so scheduling keeps working when the background worker sleeps.</li>
+      </ul>
+
+      <h3 class="subhead">Free, and staying that way</h3>
+      <p class="body-text">
+        Every feature described here is included for everyone. There is no paid tier, no trial timer, no locked setting,
+        and no upsell in the popup or on this page.
+      </p>
+    </section>
+
+    <!-- --------------------------------------------------------- privacy -->
+    <section class="section" id="privacy" aria-labelledby="privacy-heading">
+      <div class="section-head">
+        <div>
+          <h2 id="privacy-heading">Privacy</h2>
+          <p class="section-note">Short version: your browsing stays on your device.</p>
+        </div>
+      </div>
+
+      <ul class="bullets">
+        <li>No accounts, ads, analytics, or tracking libraries.</li>
+        <li>No page contents, keywords, URLs, or results are sent to a developer or to any server.</li>
+        <li>Settings and profiles are stored in local extension storage until you delete them or uninstall the extension.</li>
+        <li>Active sessions live in temporary session storage and are cleared when the browser session ends.</li>
+        <li>The extension has no external endpoints of its own; refreshing only makes the website's normal requests.</li>
+        <li>Avoid saving private text as a keyword profile on a shared computer.</li>
+      </ul>
+
+      <p class="body-text">
+        The full policy ships with the source repository as <code>docs/PRIVACY.md</code>. Uninstalling the extension removes
+        its browser-managed local storage.
+      </p>
+
+      <p class="body-text body-muted" id="app-version">Version information unavailable.</p>
+    </section>
+  </div>
+</main>
+
+<footer class="page-footer">
+  <div class="shell">
+    <p class="footer-line">
+      The Best Auto Refresh App &mdash; Refresh smarter. Stop when it matters.
+    </p>
+    <p class="footer-line footer-muted">
+      The product name is a name, not a claim of an independently verified ranking. Open source under the MIT license.
+    </p>
+  </div>
+</footer>
+
+<script src="options.js"></script>
+</body>
+</html>
