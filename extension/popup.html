@@ -63,6 +63,56 @@
     <p class="note note-warn" id="restricted-note" hidden></p>
   </section>
 
+  <!-- Quick profiles -->
+  <section class="card profile-card" id="profile-card" aria-labelledby="profile-heading">
+    <p class="eyebrow" id="profile-heading">Quick profiles</p>
+
+    <div class="field" id="profile-select-field">
+      <label class="field-label" for="profile-select">Load a saved profile</label>
+      <select class="input profile-select" id="profile-select">
+        <option value="">Choose a saved profile&hellip;</option>
+      </select>
+    </div>
+
+    <p class="hint profile-hint" id="profile-hint" role="status" aria-live="polite"></p>
+    <p class="hint" id="profile-matched" hidden></p>
+
+    <details class="advanced profile-save" id="profile-save">
+      <summary class="advanced-summary">
+        <span class="advanced-title">Save current settings</span>
+        <span class="advanced-hint">name and scope</span>
+      </summary>
+      <div class="advanced-body">
+        <div class="profile-save-form" id="profile-save-form">
+          <div class="field">
+            <label class="field-label" for="profile-name">Profile name</label>
+            <input class="input" type="text" id="profile-name" autocomplete="off" spellcheck="false"
+                   maxlength="60" placeholder="e.g. Ticket queue watch"
+                   aria-describedby="hint-profile-name err-profile-name">
+            <p class="hint" id="hint-profile-name">Uses the settings currently in the form below.</p>
+            <p class="field-error" id="err-profile-name" hidden></p>
+          </div>
+
+          <div class="field">
+            <label class="field-label" for="profile-scope">Where should it apply?</label>
+            <select class="input" id="profile-scope" aria-describedby="hint-profile-scope">
+              <option value="page" selected>This page only</option>
+              <option value="site">This website (whole site)</option>
+              <option value="global">Everywhere</option>
+            </select>
+            <p class="hint" id="hint-profile-scope">Everywhere: any tab. This website: every page on this site. This page: only this exact page.</p>
+          </div>
+
+          <p class="alert" id="profile-save-alert" role="alert" hidden></p>
+
+          <div class="actions profile-save-actions">
+            <button class="btn btn-secondary btn-grow" type="button" id="profile-save-action">Save profile</button>
+          </div>
+        </div>
+      </div>
+    </details>
+  </section>
+
   <!-- Controls -->
   <form class="card form-card" id="controls" novalidate>
 
@@ -232,6 +282,165 @@
       </div>
     </details>
 
+    <details class="advanced automation" id="automation">
+      <summary class="advanced-summary">
+        <span class="advanced-title">Automation</span>
+        <span class="advanced-hint" id="automation-summary-hint">webhooks &amp; page scripts &middot; off</span>
+      </summary>
+      <div class="advanced-body">
+
+        <p class="hint" id="hint-automation">
+          Optional extras that run only when a refresh event happens. Normal refreshing needs none of this: no webhook
+          URL and no script permission is requested unless you switch a section on and press its own button. Both
+          sections start off, and switching one off stops future automation without taking back access you granted.
+        </p>
+
+        <!-- ------------------------------------------------------- webhook -->
+        <section class="automation-block" id="automation-webhook" aria-labelledby="automation-webhook-title">
+          <div class="automation-head">
+            <label class="check automation-switch" for="automation-webhook-enabled">
+              <input type="checkbox" id="automation-webhook-enabled" aria-describedby="hint-automation-webhook">
+              <span class="automation-name" id="automation-webhook-title">Webhook</span>
+            </label>
+            <span class="pill" id="automation-webhook-status" data-status="off">Off</span>
+          </div>
+          <p class="hint" id="hint-automation-webhook">Sends a small JSON notice to a URL you choose. No request is made while this is off.</p>
+
+          <div class="automation-fields" id="automation-webhook-fields" hidden>
+            <div class="field">
+              <label class="field-label" for="automation-webhook-url">Webhook URL</label>
+              <input class="input" type="url" id="automation-webhook-url" inputmode="url" autocomplete="off"
+                     spellcheck="false" maxlength="2048" placeholder="https://example.com/refresh-hook"
+                     aria-describedby="hint-automation-webhook-url err-automation-webhook-url">
+              <p class="hint" id="hint-automation-webhook-url">
+                HTTPS for any site; plain HTTP only for local loopback addresses such as localhost or 127.0.0.1.
+                Chrome grants access to the whole hostname and ignores the port, so the permission is wider than this
+                single address.
+              </p>
+              <p class="field-error" id="err-automation-webhook-url" role="alert" hidden></p>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <label class="field-label" for="automation-webhook-method">Request method</label>
+                <select class="input" id="automation-webhook-method" aria-describedby="hint-automation-webhook-method">
+                  <option value="POST">POST &mdash; JSON body</option>
+                  <option value="GET">GET &mdash; query string</option>
+                </select>
+                <p class="hint" id="hint-automation-webhook-method">POST sends JSON. GET calls the configured address without a body.</p>
+              </div>
+              <div class="field">
+                <span class="field-label" aria-hidden="true">Connect this hostname</span>
+                <button class="btn btn-secondary" type="button" id="automation-webhook-connect"
+                        aria-describedby="hint-automation-connect automation-webhook-connection">Connect webhook</button>
+                <p class="hint" id="hint-automation-connect">Grants access only. This button sends nothing and tests nothing.</p>
+              </div>
+            </div>
+
+            <p class="status-line" id="automation-webhook-connection" role="status" aria-live="polite"></p>
+
+            <fieldset class="field">
+              <legend class="field-label">Send for these events</legend>
+              <div class="event-grid" id="automation-webhook-events" tabindex="-1"></div>
+              <p class="field-error" id="err-automation-webhook-events" role="alert" hidden></p>
+            </fieldset>
+
+            <div class="field">
+              <label class="field-label" for="automation-webhook-headers">Custom JSON headers (optional)</label>
+              <textarea class="input textarea" id="automation-webhook-headers" rows="3" maxlength="4000"
+                        spellcheck="false" autocomplete="off" placeholder="{}"
+                        aria-describedby="hint-automation-webhook-headers err-automation-webhook-headers">{}</textarea>
+              <p class="hint" id="hint-automation-webhook-headers">A JSON object of extra headers, for example {"X-Token": "abc"}. Leave it as {} for none. Headers the browser manages, such as Cookie or Host, are rejected rather than silently dropped.</p>
+              <p class="field-error" id="err-automation-webhook-headers" role="alert" hidden></p>
+            </div>
+
+            <div class="field">
+              <label class="field-label" for="automation-webhook-body">Custom JSON body (optional)</label>
+              <textarea class="input textarea" id="automation-webhook-body" rows="4" maxlength="10000" spellcheck="false"
+                        autocomplete="off" placeholder="Leave empty to send the automatic payload"
+                        aria-describedby="hint-automation-webhook-body err-automation-webhook-body"></textarea>
+              <p class="hint" id="hint-automation-webhook-body">Empty means an automatic payload of event, timestamp, refreshCount and status. A custom body must be valid JSON; inside its strings, {{event}}, {{timestamp}}, {{refreshCount}}, {{status}}, {{url}}, {{title}}, {{reason}}, {{keyword}} and {{selector}} are replaced with their values. Invalid JSON is reported when you press Start.</p>
+              <p class="field-error" id="err-automation-webhook-body" role="alert" hidden></p>
+            </div>
+
+            <label class="check" for="automation-webhook-details">
+              <input type="checkbox" id="automation-webhook-details">
+              <span>Include the page address and title in the payload</span>
+            </label>
+            <p class="hint" id="hint-automation-webhook-details">
+              Off by default. When it is on, automatic payloads also carry the page url, title and the reason your stop
+              condition matched. Page text is never included, and a custom body only sees those values while this is on.
+            </p>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------------------- JavaScript -->
+        <section class="automation-block" id="automation-script" aria-labelledby="automation-script-title">
+          <div class="automation-head">
+            <label class="check automation-switch" for="automation-script-enabled">
+              <input type="checkbox" id="automation-script-enabled" aria-describedby="hint-automation-script">
+              <span class="automation-name" id="automation-script-title">JavaScript</span>
+            </label>
+            <span class="pill" id="automation-script-status" data-status="off">Off</span>
+          </div>
+          <p class="hint" id="hint-automation-script">
+            Runs in an isolated world with access to this page's DOM. Webhook secrets and extension APIs are not provided.
+          </p>
+
+          <div class="automation-fields" id="automation-script-fields" hidden>
+            <div class="field">
+              <label class="field-label" for="automation-script-code">JavaScript to run</label>
+              <textarea class="input textarea code-input" id="automation-script-code" rows="8" maxlength="20000"
+                        spellcheck="false" autocomplete="off" wrap="off"
+                        aria-describedby="hint-automation-script-code err-automation-script-code"></textarea>
+              <div class="code-meta">
+                <p class="hint" id="hint-automation-script-code">
+                  Write an async function body. The <code>event</code> argument includes type, time, refreshCount,
+                  status, url, title, reason, keyword and selector. Local scripts always receive page context.
+                  Errors are logged; refreshing continues.
+                </p>
+                <span class="hint code-count" id="automation-script-count">0 / 20000</span>
+              </div>
+              <p class="field-error" id="err-automation-script-code" role="alert" hidden></p>
+            </div>
+
+            <div class="automation-actions">
+              <button class="btn btn-quiet btn-sm" type="button" id="automation-script-example">Add example snippet</button>
+              <button class="btn btn-secondary btn-sm" type="button" id="automation-script-enable"
+                        aria-describedby="hint-automation-script-enable automation-script-permission">Enable JavaScript on this website</button>
+            </div>
+            <p class="hint" id="hint-automation-script-enable">Nothing runs until you also press Start. The enable button only asks for access to this website's hostname.</p>
+            <p class="status-line" id="automation-script-permission" role="status" aria-live="polite"></p>
+
+            <fieldset class="field">
+              <legend class="field-label">Run for these events</legend>
+              <div class="event-grid" id="automation-script-events" tabindex="-1"></div>
+              <p class="field-error" id="err-automation-script-events" role="alert" hidden></p>
+            </fieldset>
+          </div>
+        </section>
+
+        <p class="field-error" id="err-automation" role="alert" hidden></p>
+
+        <!-- ------------------------------------------------------- activity -->
+        <details class="activity" id="automation-activity">
+          <summary class="advanced-summary">
+            <span class="advanced-title">Recent activity</span>
+            <span class="advanced-hint">last 10 &middot; this session</span>
+          </summary>
+          <div class="activity-body">
+            <div class="activity-head">
+              <p class="hint">A session-only log for this tab. Reading it sends nothing anywhere.</p>
+              <button class="btn btn-quiet btn-sm" type="button" id="automation-activity-refresh">Refresh log</button>
+            </div>
+            <ul class="activity-list" id="automation-activity-list"></ul>
+          </div>
+        </details>
+
+        <button class="btn btn-quiet btn-sm" type="button" id="automation-manage-access">Manage access in the dashboard</button>
+      </div>
+    </details>
+
     <p class="alert" id="form-alert" role="alert" hidden></p>
 
     <div class="actions">
@@ -251,6 +460,6 @@
   </div>
 </footer>
 
-<script src="popup.js"></script>
+<script type="module" src="popup.js"></script>
 </body>
 </html>

@@ -2,7 +2,7 @@
 
 **Refresh smarter. Stop when it matters.** A free, open-source Chrome and Chromium extension that refreshes a tab until the thing you care about happens.
 
-No account. No ads. No paywalls. No analytics. All monitoring happens on your device.
+No account. No ads. No paywalls. No analytics. Monitoring happens on your device; optional webhooks send only the data you configure to your chosen endpoint.
 
 ## Features
 
@@ -11,7 +11,10 @@ No account. No ads. No paywalls. No analytics. All monitoring happens on your de
 - Scope keyword checks to a CSS selector; case-sensitive and whole-word matching.
 - Point-and-click element picker; ignore noisy areas with a CSS selector.
 - Set a maximum refresh count or duration, pause/resume, preserve scroll, or bypass the cache.
-- Saved profiles and a dashboard for monitored tabs.
+- Live toolbar countdown while monitoring, even with the popup closed.
+- Quick profiles in the popup: save settings for this page, this website, or everywhere. Page profiles take priority over website profiles; unfinished edits always win. Choosing a profile loads settings without starting a monitor.
+- A dashboard for monitored tabs and saved profile management.
+- Optional automation hooks: webhooks and custom JavaScript on refreshes, checks, matches, limits, errors, start/stop, pause and resume. See [automation guide](docs/AUTOMATION.md).
 - Unfinished popup settings are remembered per tab during the browser session, so you can close the popup to copy a keyword and continue where you left off.
 - Explicit per-tab access using `activeTab`, with no all-websites permission request.
 
@@ -34,7 +37,7 @@ Monitoring requires an open tab and running browser. Background tabs, browser su
 
 ## Privacy and permissions
 
-See [Privacy policy](docs/PRIVACY.md). Required permissions are `activeTab`, `scripting`, `storage`, and `alarms`. There are no broad host permissions, tracking libraries, remote scripts, or external monitoring services.
+See [Privacy policy](docs/PRIVACY.md). Required permissions are `activeTab`, `scripting`, `storage`, and `alarms`. JavaScript and host access for automation are optional, requested only from explicit Connect/Enable buttons. No host access is required for normal refreshing. There are no tracking libraries or developer monitoring services. Chrome/Chromium 135 or newer is required; custom scripts also need Chrome's Allow User Scripts setting.
 
 ## Development
 

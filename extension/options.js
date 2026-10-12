@@ -5,7 +5,14 @@
  *   { type: 'STOP' | 'PAUSE' | 'RESUME', tabId }   -> { ok:true, state } | { ok:false, error }
  *
  * Locally owned storage keys: `defaults` (one config) and `profiles` (saved configs).
+ *
+ * Automation (webhooks and page scripts) is configured in the popup, for the tab
+ * the user is looking at. This page never edits it, but it must never erase it
+ * either: the normalised `actions` of whatever was loaded is carried through
+ * every save, and the dashboard shows and revokes the optional access granted.
  */
+
+import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
 
 'use strict';
 
@@ -40,7 +47,8 @@
     preserveScroll: true,
     bypassCache: false,
     pauseWhenHidden: false,
-    ignoreSelector: ''
+    ignoreSelector: '',
+    actions: DEFAULT_ACTIONS
   });
 
   const STOP_CONDITION_SET = new Set([
@@ -89,6 +97,22 @@
   const PRESET_VALUES = ['10', '30', '60'];
   const PREVIEW_NOTE = 'Preview only — nothing was saved to browser storage.';
 
+  // How many optional entries the access list will render. A generous ceiling
+  // that still keeps a pathological getAll() result from flooding the page.
+  const MAX_PERMISSION_ROWS = 50;
+
+  // Profile scope metadata. `scope: 'global' | 'site' | 'page'` with `target`
+  // holding the exact origin for site profiles and origin+pathname+search for
+  // page profiles; global profiles keep an empty target. Profiles saved before
+  // scopes existed read back as global, so nothing is lost.
+  const PROFILE_SCOPE_SET = new Set(['page', 'site', 'global']);
+  const PROFILE_SCOPE_NOUN = {
+    page: 'this page only',
+    site: 'this website',
+    global: 'everywhere'
+  };
+  const MAX_PROFILE_NAME = 60;
+
   // ------------------------------------------------------------ environment
 
   const env = (() => {
@@ -101,6 +125,13 @@
       extensionId,
       hasStorage: hasChrome && !!chrome.storage && !!chrome.storage.local,
       hasManifest: hasRuntime && typeof chrome.runtime.getManifest === 'function',
+      // Optional-permission management. Absent on old builds (or in a preview
+      // page), which the Automation access section explains rather than breaking.
+      hasPermissions: hasChrome && !!chrome.permissions
+        && typeof chrome.permissions.getAll === 'function'
+        && typeof chrome.permissions.remove === 'function',
+      hasPermissionEvents: hasChrome && !!chrome.permissions
+        && !!chrome.permissions.onAdded && typeof chrome.permissions.onAdded.addListener === 'function',
       live: hasRuntime && extensionId !== '' && hasChrome && !!chrome.tabs && typeof chrome.tabs.query === 'function'
     };
   })();
@@ -118,7 +149,8 @@
     'case-sensitive', 'whole-word', 'preserve-scroll', 'bypass-cache',
     'pause-when-hidden', 'defaults-alert', 'defaults-note', 'save-defaults',
     'reset-defaults', 'profile-name', 'save-profile', 'profiles-list',
-    'profiles-note', 'profiles-alert', 'app-version'
+    'profiles-note', 'profiles-alert', 'app-version',
+    'refresh-permissions', 'permissions-status', 'permissions-alert', 'permissions-list'
   ].forEach((id) => { ui[id] = document.getElementById(id); });
 
   // ------------------------------------------------------------------ state
@@ -130,6 +162,10 @@
   let statusTimer = null;
   let requestInFlight = false;
   let statusHoldUntil = 0;
+  // The automation this page is carrying. It is owned by the popup, so the
+  // dashboard only ever holds the normalised copy of what it loaded and writes
+  // that same copy back; saving defaults here must never clear it.
+  let currentActions = DEFAULT_ACTIONS;
   const rows = new Map();
 
   // ------------------------------------------------------------ small utils
@@ -196,8 +232,20 @@
       preserveScroll: source.preserveScroll !== false,
       bypassCache: source.bypassCache === true,
       pauseWhenHidden: source.pauseWhenHidden === true,
-      ignoreSelector: typeof source.ignoreSelector === 'string' ? source.ignoreSelector : ''
+      ignoreSelector: typeof source.ignoreSelector === 'string' ? source.ignoreSelector : '',
+      // Automation survives every defaults/profile round trip untouched.
+      actions: normalizeActions(source.actions)
     };
+  }
+
+  /** "Includes a webhook." / "Includes a page script." for profile meta lines. */
+  function profileAutomationLabel(raw) {
+    const actions = normalizeActions(raw);
+    const parts = [];
+    if (actions.webhook.enabled) parts.push('a webhook');
+    if (actions.script.enabled) parts.push('a page script');
+    if (!parts.length) return '';
+    return `automation: ${parts.join(' + ')}`;
   }
 
   function describeInterval(config) {
@@ -297,16 +345,63 @@
     });
   }
 
+  // --------------------------------------------------------- profile scopes
+
+  /** A parsed http(s) address, so credentials never reach stored scope text. */
+  function parseHttpUrl(raw) {
+    if (typeof raw !== 'string' || raw === '') return null;
+    try {
+      const url = new URL(raw);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+      return { origin: url.origin, pathname: url.pathname || '/', search: url.search || '' };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function normalizeScope(raw) {
+    return PROFILE_SCOPE_SET.has(raw) ? raw : 'global';
+  }
+
+  function scopeTarget(scope, raw) {
+    if (scope === 'global') return '';
+    const parts = parseHttpUrl(raw);
+    if (!parts) return '';
+    return scope === 'site' ? parts.origin : `${parts.origin}${parts.pathname}${parts.search}`;
+  }
+
+  function normalizeProfileTarget(scope, raw) {
+    if (scope === 'global') return '';
+    if (typeof raw !== 'string' || raw === '') return '';
+    const parts = parseHttpUrl(raw);
+    if (!parts) return '';
+    return scope === 'site' ? parts.origin : `${parts.origin}${parts.pathname}${parts.search}`;
+  }
+
+  /** Plain-language description of what a profile applies to. */
+  function describeScope(scope, target) {
+    const noun = PROFILE_SCOPE_NOUN[scope] || PROFILE_SCOPE_NOUN.global;
+    if (scope === 'global' || !target) return `Applies ${noun}`;
+    const parts = parseHttpUrl(target);
+    const where = parts ? (scope === 'site' ? parts.origin : `${parts.origin}${parts.pathname}${parts.search}`) : target;
+    return `Applies ${noun} · ${where}`;
+  }
+
   function readProfiles(raw) {
     if (!Array.isArray(raw)) return [];
     return raw
       .filter((item) => item && typeof item === 'object' && typeof item.name === 'string')
-      .map((item, index) => ({
-        id: typeof item.id === 'string' && item.id ? item.id : `profile-${index}`,
-        name: item.name,
-        config: normalizeConfig(item.config),
-        updatedAt: Number.isFinite(item.updatedAt) ? item.updatedAt : null
-      }));
+      .map((item, index) => {
+        const scope = normalizeScope(item.scope);
+        return {
+          id: typeof item.id === 'string' && item.id ? item.id : `profile-${index}`,
+          name: item.name.slice(0, MAX_PROFILE_NAME),
+          config: normalizeConfig(item.config),
+          updatedAt: Number.isFinite(item.updatedAt) ? item.updatedAt : null,
+          scope,
+          target: normalizeProfileTarget(scope, item.target)
+        };
+      });
   }
 
   // --------------------------------------------------------- live regions
@@ -508,7 +603,10 @@
       preserveScroll: ui['preserve-scroll'].checked,
       bypassCache: ui['bypass-cache'].checked,
       pauseWhenHidden: ui['pause-when-hidden'].checked,
-      ignoreSelector
+      ignoreSelector,
+      // Never edited here, but always carried: saving defaults or a profile from
+      // the dashboard keeps whatever automation the popup already stored.
+      actions: currentActions
     });
 
     return { config, errors };
@@ -516,6 +614,7 @@
 
   function applyConfigToForm(raw) {
     const config = normalizeConfig(raw);
+    currentActions = config.actions;
     const preset = config.intervalMode === 'fixed' && PRESET_VALUES.includes(String(config.intervalSeconds))
       ? String(config.intervalSeconds)
       : 'custom';
@@ -822,7 +921,7 @@
   }
 
   async function saveProfile() {
-    const name = ui['profile-name'].value.trim();
+    const name = ui['profile-name'].value.trim().slice(0, MAX_PROFILE_NAME);
     const { config, errors } = collectForm();
     if (errors.length) { showErrors(errors); return; }
     if (!name) {
@@ -838,12 +937,20 @@
     }
     const stored = await storageGet(['profiles']);
     const profiles = readProfiles(stored.profiles);
-    const duplicate = profiles.find((profile) => profile.name.toLowerCase() === name.toLowerCase());
+    const nameKey = name.toLowerCase();
+    // This page saves an unscoped profile. Only a global profile with the same
+    // name is treated as the same entry: a scoped profile that happens to share
+    // the name keeps its own settings, scope, and target untouched.
+    const duplicate = profiles.find(
+      (profile) => profile.scope === 'global' && profile.name.toLowerCase() === nameKey
+    );
     const entry = {
       id: duplicate ? duplicate.id : `p_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
       name,
       config,
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
+      scope: 'global',
+      target: ''
     };
     const next = duplicate
       ? profiles.map((profile) => (profile.id === duplicate.id ? entry : profile))
@@ -914,11 +1021,14 @@
       const info = makeEl('div', 'profile-info');
       info.appendChild(makeEl('span', 'profile-name', profile.name));
       const meta = [
+        describeScope(profile.scope, profile.target),
         describeInterval(profile.config),
         CONDITION_TEXT[profile.config.stopCondition] || profile.config.stopCondition
       ];
       if (profile.config.keyword) meta.push(`keyword “${profile.config.keyword}”`);
       if (profile.config.selector) meta.push(`selector ${profile.config.selector}`);
+      const automation = profileAutomationLabel(profile.config.actions);
+      if (automation) meta.push(automation);
       if (profile.updatedAt) meta.push(`saved ${formatWhen(profile.updatedAt)}`);
       info.appendChild(makeEl('span', 'profile-meta', meta.join(' · ')));
 
@@ -949,6 +1059,163 @@
       item.append(info, actions);
       list.appendChild(item);
     });
+  }
+
+  // ------------------------------------------------------ automation access
+
+  function setPermissionsStatus(text, variant) {
+    if (!ui['permissions-status']) return;
+    ui['permissions-status'].textContent = text || '';
+    ui['permissions-status'].className = 'status-line' + (variant ? ` ${variant}` : '');
+  }
+
+  function setPermissionsAlert(text) {
+    if (!ui['permissions-alert']) return;
+    ui['permissions-alert'].textContent = text || '';
+    ui['permissions-alert'].hidden = !text;
+  }
+
+  function manifestHostPermissions() {
+    if (!env.hasManifest) return [];
+    try {
+      const manifest = chrome.runtime.getManifest();
+      return Array.isArray(manifest && manifest.host_permissions) ? manifest.host_permissions : [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  function permissionsGetAll() {
+    return new Promise((resolve) => {
+      if (!env.hasPermissions) {
+        resolve(null);
+        return;
+      }
+      try {
+        chrome.permissions.getAll((all) => {
+          const failed = chrome.runtime && chrome.runtime.lastError;
+          resolve(failed ? null : (all && typeof all === 'object' ? all : null));
+        });
+      } catch (error) {
+        resolve(null);
+      }
+    });
+  }
+
+  function permissionsRemove(descriptor) {
+    return new Promise((resolve) => {
+      if (!env.hasPermissions) {
+        resolve(false);
+        return;
+      }
+      try {
+        chrome.permissions.remove(descriptor, (removed) => {
+          const failed = chrome.runtime && chrome.runtime.lastError;
+          resolve(!failed && removed === true);
+        });
+      } catch (error) {
+        resolve(false);
+      }
+    });
+  }
+
+  function permissionRow(name, meta, granted, actionLabel, onRevoke) {
+    const item = makeEl('li', 'perm');
+    const info = makeEl('div', 'perm-info');
+    info.appendChild(makeEl('span', 'perm-name', name));
+    info.appendChild(makeEl('span', 'perm-meta', meta));
+    item.appendChild(info);
+
+    item.appendChild(makeEl('span', granted ? 'perm-state is-granted' : 'perm-state', granted ? 'Granted' : 'Not granted'));
+
+    if (granted && typeof onRevoke === 'function') {
+      const actions = makeEl('div', 'perm-actions');
+      const button = makeEl('button', 'btn btn-danger-quiet btn-sm', actionLabel);
+      button.type = 'button';
+      button.setAttribute('aria-label', `${actionLabel}: ${name}`);
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        const removed = await onRevoke();
+        button.disabled = false;
+        if (!removed) {
+          setPermissionsAlert('That access could not be revoked. Please try again.');
+          return;
+        }
+        setPermissionsAlert('');
+        await renderPermissions();
+      });
+      actions.appendChild(button);
+      item.appendChild(actions);
+    }
+    return item;
+  }
+
+  /**
+   * Lists the optional access this extension actually holds. Required host
+   * permissions are left out: they belong to the extension's own tab access and
+   * are not something the user granted for automation.
+   */
+  async function renderPermissions() {
+    const list = ui['permissions-list'];
+    if (!list) return;
+    clearNode(list);
+
+    if (!env.live) {
+      setPermissionsStatus('Preview only — optional access cannot be read from this page.', '');
+      list.appendChild(makeEl('li', 'perm-empty', 'Preview only — granted automation access appears here once the extension is loaded in your browser.'));
+      return;
+    }
+
+    if (!env.hasPermissions) {
+      setPermissionsStatus('This browser build does not expose chrome.permissions, so optional access cannot be listed or revoked here.', 'is-error');
+      return;
+    }
+
+    setPermissionsStatus('Reading granted access…', '');
+    const all = await permissionsGetAll();
+    if (!all) {
+      setPermissionsStatus('Granted access could not be read.', 'is-error');
+      list.appendChild(makeEl('li', 'perm-empty', 'Granted access could not be read. Reload this page and try again.'));
+      return;
+    }
+
+    const required = new Set(manifestHostPermissions());
+    const origins = Array.isArray(all.origins)
+      ? all.origins.filter((origin) => typeof origin === 'string' && !required.has(origin))
+      : [];
+    const hasUserScripts = Array.isArray(all.permissions) && all.permissions.indexOf('userScripts') !== -1;
+
+    list.appendChild(permissionRow(
+      'userScripts',
+      'Lets an enabled JavaScript action run in an isolated world on the sites you granted. Chrome 138 and later also needs “Allow User Scripts” switched on by hand in this extension’s Details page.',
+      hasUserScripts,
+      'Revoke JavaScript access',
+      () => permissionsRemove({ permissions: ['userScripts'] })
+    ));
+
+    origins.slice(0, MAX_PERMISSION_ROWS).forEach((origin) => {
+      list.appendChild(permissionRow(
+        origin,
+        'Automation access for webhooks and page scripts on this hostname. Chrome ignores the port and path. Revoking this stops both kinds of hooks that use this host.',
+        true,
+        'Revoke hostname access',
+        () => permissionsRemove({ origins: [origin] })
+      ));
+    });
+
+    if (!origins.length) {
+      const empty = makeEl('li', 'perm-empty');
+      empty.appendChild(makeEl('strong', '', 'No automation hostnames are granted.'));
+      empty.appendChild(document.createTextNode(' Connect webhook or Enable JavaScript requests one hostname.'));
+      list.appendChild(empty);
+    }
+
+    const parts = [
+      origins.length === 1 ? '1 granted automation hostname' : `${origins.length} granted automation hostnames`,
+      hasUserScripts ? 'JavaScript access granted' : 'JavaScript access not granted'
+    ];
+    if (origins.length > MAX_PERMISSION_ROWS) parts.push(`showing the first ${MAX_PERMISSION_ROWS}`);
+    setPermissionsStatus(`${parts.join(' · ')}.`, '');
   }
 
   // ----------------------------------------------------------------- events
@@ -1010,6 +1277,22 @@
     ui['save-profile'].addEventListener('click', saveProfile);
     ui['refresh-sessions'].addEventListener('click', () => loadSessions({ announce: true }));
     ui['stop-all-tabs'].addEventListener('click', stopAll);
+    ui['refresh-permissions'].addEventListener('click', () => {
+      setPermissionsAlert('');
+      renderPermissions();
+    });
+
+    if (env.hasPermissionEvents) {
+      const onPermissionChange = () => renderPermissions();
+      try {
+        chrome.permissions.onAdded.addListener(onPermissionChange);
+        if (chrome.permissions.onRemoved && typeof chrome.permissions.onRemoved.addListener === 'function') {
+          chrome.permissions.onRemoved.addListener(onPermissionChange);
+        }
+      } catch (error) {
+        /* No permission events here; the refresh button still works. */
+      }
+    }
   }
 
   function wireStorageSync() {
@@ -1038,6 +1321,9 @@
     ui['stop-all-tabs'].disabled = true;
     ui['refresh-sessions'].title = 'Preview only — needs the extension engine.';
     ui['stop-all-tabs'].title = 'Preview only — needs the extension engine.';
+    ui['refresh-permissions'].disabled = true;
+    ui['refresh-permissions'].title = 'Preview only — permission state cannot be read here.';
+    setPermissionsStatus('Preview only — optional access cannot be read from this page.', '');
   }
 
   function showVersion() {
@@ -1090,6 +1376,7 @@
     applyConfigToForm(stored.defaults);
     formDirty = false;
     renderProfiles(readProfiles(stored.profiles));
+    await renderPermissions();
 
     if (!env.live) {
       await loadSessions({});

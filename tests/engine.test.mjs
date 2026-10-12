@@ -9,6 +9,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  BADGE_PENDING_TEXT,
+  COUNTDOWN_MIN_GAP_MS,
   DEFAULT_CONFIG,
   MIN_INTERVAL_SECONDS,
   STOP_CONDITIONS,
@@ -16,10 +18,13 @@ import {
   alarmNameForTab,
   attributeSelector,
   badgeColorFor,
+  badgeCountdownText,
   badgeTextFor,
   buildSelectorFromParts,
   bumpGeneration,
   clampIntervalSeconds,
+  compactCountdownText,
+  countdownSecondsUntil,
   createBaseline,
   createSessionRecord,
   describeRestrictedTarget,
@@ -39,12 +44,15 @@ import {
   planCycle,
   publicSessionState,
   sameOrigin,
+  sessionBadgeText,
+  shouldAcceptCountdown,
   shouldAcceptTick,
   tabIdFromAlarmName,
   truncateText,
   usesPageTimer,
   validateConfig,
   validateContentMessage,
+  validateCountdownMessage,
   validatePickMessage,
   validateUiMessage,
   watchdogDelayMs,
@@ -696,13 +704,125 @@ test('sameOrigin and originOf compare pages for cross-origin stops', () => {
 
 test('badge text and colors cover every status', () => {
   assert.equal(badgeTextFor('matched'), 'DONE');
-  assert.equal(badgeTextFor('running'), 'ON');
+  assert.equal(badgeTextFor('running'), BADGE_PENDING_TEXT, 'running without a deadline is pending, never 0');
   assert.equal(badgeTextFor('paused'), 'II');
   assert.equal(badgeTextFor('stopped'), '');
+  assert.equal(badgeTextFor('error'), 'ERR');
   assert.equal(badgeTextFor('nonsense'), '');
   assert.equal(badgeColorFor('error'), '#b91c1c');
   assert.equal(badgeColorFor('running'), '#0f766e');
   assert.equal(badgeColorFor(undefined), '#94a3b8');
+});
+
+test('the badge countdown shows exact seconds, then compact minutes and hours', () => {
+  const now = 1_000_000;
+
+  assert.equal(countdownSecondsUntil(null, now), null, 'no deadline means pending, not zero');
+  assert.equal(countdownSecondsUntil(undefined, now), null);
+  assert.equal(countdownSecondsUntil(now, now), 0);
+  assert.equal(countdownSecondsUntil(now + 1, now), 1);
+  assert.equal(countdownSecondsUntil(now + 1_500, now), 2, 'seconds round up');
+  assert.equal(countdownSecondsUntil(now + 999_000, now), 999);
+  assert.equal(countdownSecondsUntil(now - 5_000, now), -5, 'past deadlines are reported as negative');
+
+  assert.equal(compactCountdownText(0), '0');
+  assert.equal(compactCountdownText(1), '1');
+  assert.equal(compactCountdownText(999), '999');
+  assert.equal(compactCountdownText(1000), '16m', '1000s is 16.7 minutes rounded down');
+  assert.equal(compactCountdownText(3599), '59m');
+  assert.equal(compactCountdownText(3600), '1h');
+  assert.equal(compactCountdownText(86_400), '24h');
+  assert.equal(compactCountdownText(-10), '0', 'a past deadline never shows a negative badge');
+  assert.equal(compactCountdownText(null), '0');
+
+  assert.equal(badgeCountdownText(null, now), BADGE_PENDING_TEXT);
+  assert.equal(badgeCountdownText(now + 1_500, now), '2');
+  assert.equal(badgeCountdownText(now + 999_000, now), '999');
+  assert.equal(badgeCountdownText(now + 1_000_000, now), '16m');
+  assert.equal(badgeCountdownText(now - 1_000, now), '0');
+});
+
+test('sessionBadgeText maps every session status to the toolbar text', () => {
+  const now = 1_000_000;
+  assert.equal(sessionBadgeText(null, now), '');
+  assert.equal(
+    sessionBadgeText({ status: 'running', nextRefreshAt: now + 42_000 }, now),
+    '42'
+  );
+  assert.equal(
+    sessionBadgeText({ status: 'running', nextRefreshAt: null }, now),
+    BADGE_PENDING_TEXT,
+    'loading, settling and checking must not show a misleading 0'
+  );
+  assert.equal(sessionBadgeText({ status: 'paused', nextRefreshAt: now + 42_000 }, now), 'II');
+  assert.equal(sessionBadgeText({ status: 'matched', nextRefreshAt: null }, now), 'DONE');
+  assert.equal(sessionBadgeText({ status: 'stopped', nextRefreshAt: null }, now), '');
+  assert.equal(sessionBadgeText({ status: 'error', nextRefreshAt: null }, now), 'ERR');
+});
+
+test('validateCountdownMessage requires the top frame, identity and origin', () => {
+  const record = makeRecord({
+    tabId: 7,
+    token: 'token-abc',
+    origin: 'https://example.com',
+    status: 'running',
+    nextRefreshAt: 50_000
+  });
+  const sender = { tab: { id: 7 }, frameId: 0, origin: 'https://example.com' };
+  const base = { type: 'ABRA_COUNTDOWN', tabId: 7, token: 'token-abc', generation: 1 };
+
+  assert.equal(validateCountdownMessage(record, sender, { ...base }).ok, true);
+  assert.equal(
+    validateCountdownMessage(record, { ...sender, frameId: 4 }, { ...base }).ok,
+    false,
+    'subframes may not drive the countdown'
+  );
+  assert.equal(validateCountdownMessage(record, { tab: { id: 7 } }, { ...base }).ok, false, 'missing frameId');
+  assert.equal(validateCountdownMessage(record, sender, { ...base, type: 'ABRA_REPORT' }).ok, false);
+  assert.equal(validateCountdownMessage(record, sender, { ...base, tabId: 8 }).ok, false);
+  assert.equal(validateCountdownMessage(record, { tab: { id: 8 }, frameId: 0 }, { ...base }).ok, false);
+  assert.equal(validateCountdownMessage(record, sender, { ...base, token: 'other' }).ok, false);
+  assert.equal(validateCountdownMessage(record, sender, { ...base, token: '' }).ok, false);
+  assert.equal(validateCountdownMessage(record, sender, { ...base, generation: 2 }).ok, false);
+  assert.equal(validateCountdownMessage(record, sender, { ...base, generation: '1' }).ok, true);
+  assert.equal(validateCountdownMessage(null, sender, { ...base }).ok, false);
+  assert.equal(validateCountdownMessage(record, { frameId: 0 }, { ...base }).ok, false, 'no sender.tab');
+  assert.equal(validateCountdownMessage(record, sender, null).ok, false);
+
+  // A changed page origin is refused once the session knows its origin.
+  assert.equal(
+    validateCountdownMessage(record, { tab: { id: 7 }, frameId: 0, origin: 'https://evil.example' }, { ...base }).ok,
+    false
+  );
+  assert.equal(
+    validateCountdownMessage(record, { tab: { id: 7 }, frameId: 0, url: 'https://example.com/x' }, { ...base }).ok,
+    true,
+    'sender.url is used when origin is absent'
+  );
+  const unknownOrigin = makeRecord({ tabId: 7, token: 'token-abc', origin: '', status: 'running' });
+  assert.equal(
+    validateCountdownMessage(unknownOrigin, { tab: { id: 7 }, frameId: 0, origin: 'https://other.example' }, { ...base }).ok,
+    true,
+    'an upgraded record without a stored origin still accepts the tab'
+  );
+
+  const paused = makeRecord({ tabId: 7, token: 'token-abc', origin: 'https://example.com', status: 'paused' });
+  assert.equal(validateCountdownMessage(paused, sender, { ...base }).ok, true, 'paused is tolerated, then ignored');
+  const matched = makeRecord({ tabId: 7, token: 'token-abc', origin: 'https://example.com', status: 'matched' });
+  assert.equal(validateCountdownMessage(matched, sender, { ...base }).ok, false, 'a finished session stops the beat');
+});
+
+test('shouldAcceptCountdown rate-gates flooding heartbeats', () => {
+  assert.equal(shouldAcceptCountdown(null, 1_000), true);
+  assert.equal(shouldAcceptCountdown(0, 1_000), true);
+  assert.equal(shouldAcceptCountdown(1_000, 1_000), false, 'a same-millisecond duplicate is refused');
+  assert.equal(shouldAcceptCountdown(1_000, 1_000 + COUNTDOWN_MIN_GAP_MS - 1), false);
+  assert.equal(shouldAcceptCountdown(1_000, 1_000 + COUNTDOWN_MIN_GAP_MS), true);
+  assert.equal(shouldAcceptCountdown(1_000, 2_000), true);
+  assert.equal(shouldAcceptCountdown(1_000, 1_399, 400), false);
+  assert.equal(shouldAcceptCountdown(1_000, 1_400, 400), true);
+  assert.equal(shouldAcceptCountdown(5, Number.NaN), false);
+  assert.equal(COUNTDOWN_MIN_GAP_MS, 250);
 });
 
 /* -------------------------------------------------------------------------- */
@@ -713,7 +833,7 @@ const extensionDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'ext
 const manifest = JSON.parse(readFileSync(resolve(extensionDir, 'manifest.json'), 'utf8'));
 
 test('the runtime message contract is exactly the documented set', () => {
-  assert.deepEqual([...UI_MESSAGE_TYPES], ['START', 'STOP', 'PAUSE', 'RESUME', 'GET_STATE', 'GET_ALL', 'PICK_ELEMENT']);
+  assert.deepEqual([...UI_MESSAGE_TYPES], ['START', 'STOP', 'PAUSE', 'RESUME', 'GET_STATE', 'GET_ALL', 'PICK_ELEMENT', 'ACTION_CAPABILITIES', 'ACTION_LOG', 'DISABLE_ACTION']);
   assert.deepEqual([...STOP_CONDITIONS], [
     'never',
     'page-change',
@@ -727,6 +847,7 @@ test('the runtime message contract is exactly the documented set', () => {
 
 test('the default config keeps the exact keys and values the UI sends', () => {
   assert.deepEqual(Object.keys(DEFAULT_CONFIG).sort(), [
+    'actions',
     'bypassCache',
     'caseSensitive',
     'ignoreSelector',
@@ -757,8 +878,8 @@ test('manifest requests only activeTab, scripting, storage and alarms', () => {
   assert.equal(manifest.manifest_version, 3);
   assert.deepEqual([...manifest.permissions].sort(), ['activeTab', 'alarms', 'scripting', 'storage']);
   assert.equal(manifest.host_permissions, undefined);
-  assert.equal(manifest.optional_permissions, undefined);
-  assert.equal(manifest.optional_host_permissions, undefined);
+  assert.deepEqual(manifest.optional_permissions, ['userScripts']);
+  assert.deepEqual(manifest.optional_host_permissions, ['https://*/*', 'http://localhost/*', 'http://127.0.0.1/*']);
   assert.equal(manifest.content_scripts, undefined);
   assert.equal(manifest.web_accessible_resources, undefined);
   assert.equal(manifest.background.service_worker, 'background.js');
@@ -798,6 +919,17 @@ test('background uses the service worker safe scheduling path', () => {
   assert.equal(/setInterval\s*\(/.test(source), false, 'no long-lived background timers');
   assert.match(source, /chrome\.alarms\.create/, 'the watchdog alarm drives long waits');
   assert.match(source, /chrome\.storage\.session/, 'sessions stay in durable session storage');
+  assert.match(source, /sessionBadgeText/, 'the running badge uses the shared countdown formatter');
+  assert.match(source, /refreshBadge\(record\)/, 'hydration reapplies the badge after a worker restart');
+  assert.match(source, /validateCountdownMessage/, 'heartbeats are authenticated before the badge moves');
+  assert.match(source, /shouldAcceptCountdown/, 'heartbeat flooding is rate gated');
+  const countdownBody = /function handleCountdown[\s\S]*?\n}/.exec(source);
+  assert.ok(countdownBody, 'the countdown handler exists');
+  assert.equal(
+    /persistSessions|withTabLock|chrome\.storage/.test(countdownBody[0]),
+    false,
+    'a heartbeat never persists sessions, takes the tab lock or touches storage'
+  );
 });
 
 test('content script owns page timers and re-injection guard', () => {
@@ -805,4 +937,7 @@ test('content script owns page timers and re-injection guard', () => {
   assert.match(source, /setTimeout/, 'sub-30s waits are page timers');
   assert.match(source, /__ABRA_ENGINE__/, 're-injection must be idempotent');
   assert.match(source, /data-abra-picker/, 'the picker overlay is excluded from text collection');
+  assert.match(source, /ABRA_COUNTDOWN/, 'the page sends the authenticated countdown heartbeat');
+  assert.equal(/\bsetInterval\s*\(/.test(source), false, 'the heartbeat is a single chained timeout');
+  assert.match(source, /pagehide[\s\S]{0,300}?stopCountdown\(\)/, 'unload clears the heartbeat');
 });

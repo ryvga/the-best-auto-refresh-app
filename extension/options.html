@@ -37,6 +37,7 @@
       <a href="#monitor">Monitored tabs</a>
       <a href="#defaults">Default settings</a>
       <a href="#profiles">Profiles</a>
+      <a href="#automation">Automation access</a>
       <a href="#help">Help</a>
       <a href="#privacy">Privacy</a>
     </nav>
@@ -262,6 +263,7 @@
       <div>
         <h2 id="profiles-heading">Profiles</h2>
         <p class="section-note">Save the settings above as a named profile, then load it whenever you need that setup again. Profiles live in local extension storage on this device.</p>
+        <p class="section-note">Profiles saved here apply everywhere. A profile can also be limited to one website or one page from the popup's Quick profiles card; those keep their scope, and saving the same global name again updates that profile only.</p>
       </div>
     </div>
 
@@ -279,6 +281,37 @@
     <p class="alert" id="profiles-alert" role="alert" hidden></p>
 
     <ul class="profiles" id="profiles-list" aria-label="Saved profiles"></ul>
+  </section>
+
+  <!-- --------------------------------------------------------- automation -->
+  <section class="section" id="automation" aria-labelledby="automation-heading">
+    <div class="section-head">
+      <div>
+        <h2 id="automation-heading">Automation access</h2>
+        <p class="section-note">
+          Webhooks and page scripts are set up in the popup's <strong>Automation</strong> section, for the tab you are
+          looking at. This page only shows the optional access those features were granted and lets you take it back.
+        </p>
+        <p class="section-note">
+          Chrome grants automation access to a whole hostname and ignores the port, so granting
+          <code>https://example.com/*</code> allows every address on that hostname, not one endpoint. Revoking removes
+          the access for this extension only; normal refreshing never needs any of it.
+        </p>
+      </div>
+      <div class="section-actions">
+        <button class="btn btn-secondary" type="button" id="refresh-permissions">Refresh access list</button>
+      </div>
+    </div>
+
+    <p class="status-line" id="permissions-status" role="status" aria-live="polite">Loading granted access&hellip;</p>
+    <p class="status-line is-error" id="permissions-alert" role="alert" hidden></p>
+
+    <ul class="perm-list" id="permissions-list" aria-label="Optional access granted to automation"></ul>
+
+    <p class="body-text body-muted">
+      Nothing is granted by saving defaults, loading a profile, or pressing Start. Access is only requested when you
+      press Connect webhook or Enable JavaScript on this website in the popup.
+    </p>
   </section>
 
   <!-- ------------------------------------------------------------- help -->
@@ -321,6 +354,7 @@
         <li><strong>scripting</strong> &mdash; adds the local monitoring script and element picker to that tab.</li>
         <li><strong>storage</strong> &mdash; keeps your settings, profiles, and temporary session state.</li>
         <li><strong>alarms</strong> &mdash; wakes the extension so scheduling keeps working when the background worker sleeps.</li>
+        <li><strong>Optional automation access</strong> &mdash; the <code>userScripts</code> permission and per-hostname access are requested only when you press <em>Connect webhook</em> or <em>Enable JavaScript on this website</em> in the popup. Refreshing never needs them, and they can be revoked in <a href="#automation">Automation access</a>.</li>
       </ul>
 
       <h3 class="subhead">Free, and staying that way</h3>
@@ -335,16 +369,17 @@
       <div class="section-head">
         <div>
           <h2 id="privacy-heading">Privacy</h2>
-          <p class="section-note">Short version: your browsing stays on your device.</p>
+          <p class="section-note">Monitoring stays local. Optional hooks run as you configure them.</p>
         </div>
       </div>
 
       <ul class="bullets">
         <li>No accounts, ads, analytics, or tracking libraries.</li>
-        <li>No page contents, keywords, URLs, or results are sent to a developer or to any server.</li>
+        <li>The developer does not collect your page contents, keywords, URLs or results.</li>
+        <li>Automation is off by default. Enabled webhooks send your configured payload to your chosen endpoint. URLs, titles, keywords, selectors and reasons are excluded unless you opt in; page text is never included automatically. A custom script can read or change the page and make requests defined by your code.</li>
         <li>Settings and profiles are stored in local extension storage until you delete them or uninstall the extension.</li>
         <li>Active sessions live in temporary session storage and are cleared when the browser session ends.</li>
-        <li>The extension has no external endpoints of its own; refreshing only makes the website's normal requests.</li>
+        <li>Refreshing makes the website's normal requests. Optional webhooks also send the data you configure to your chosen endpoint. Page details are excluded by default. Custom JavaScript runs only when enabled for a monitored tab.</li>
         <li>Avoid saving private text as a keyword profile on a shared computer.</li>
       </ul>
 
@@ -369,6 +404,6 @@
   </div>
 </footer>
 
-<script src="options.js"></script>
+<script type="module" src="options.js"></script>
 </body>
 </html>

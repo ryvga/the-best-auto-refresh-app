@@ -1,6 +1,6 @@
 {
   "name": "the-best-auto-refresh-app",
-  "version": "1.0.1",
+  "version": "1.2.0",
   "private": true,
   "description": "Engine and tests for The Best Auto Refresh App Chrome extension (vanilla JS, no runtime dependencies).",
   "license": "MIT",
@@ -9,7 +9,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test tests/engine.test.mjs",
-    "test:watch": "node --test --watch tests/engine.test.mjs"
+    "test": "node --test tests/*.test.mjs",
+    "test:watch": "node --test --watch tests/*.test.mjs"
   }
 }

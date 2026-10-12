@@ -7,6 +7,8 @@
  *   - collect the visible, normalized text snapshot the background evaluates;
  *   - execute validated reload / stop decisions coming from the background;
  *   - preserve scroll position across reloads;
+ *   - keep the toolbar countdown alive after the popup closes with a one-per-
+ *     second ABRA_COUNTDOWN heartbeat (identity only, no page content);
  *   - render the element picker overlay.
  *
  * It never decides on its own whether a condition matched: it reports a
@@ -23,6 +25,8 @@
   const PICKER_ATTR = 'data-abra-picker';
   const SCROLL_KEY = '__abra_scroll_v1';
   const MAX_TEXT_CHARS = 200000;
+  /** One badge heartbeat per second; the background rate-gates faster senders. */
+  const COUNTDOWN_INTERVAL_MS = 1000;
   const NOISE_TAGS = new Set([
     'SCRIPT',
     'STYLE',
@@ -121,6 +125,8 @@
   let cycleSeq = 0;
   let needsSettle = true;
   let picker = null;
+  let countdownTimerId = 0;
+  let countdownSeq = 0;
 
   const engine = { version: VERSION };
 
@@ -138,6 +144,66 @@
   function abortCycle() {
     cycleSeq += 1;
     clearTimer();
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Countdown heartbeat                                                    */
+  /* ---------------------------------------------------------------------- */
+
+  /**
+   * The popup may be closed, and a service-worker timer is never assumed to
+   * live, so the page itself nudges the background once per second while a
+   * session runs. The payload is identity only: the background recomputes the
+   * number from its own deadline. Exactly one chained timeout exists at a time.
+   */
+  function stopCountdown() {
+    countdownSeq += 1;
+    if (countdownTimerId) {
+      clearTimeout(countdownTimerId);
+      countdownTimerId = 0;
+    }
+  }
+
+  function scheduleCountdown(seq) {
+    if (seq !== countdownSeq || !session || session.status !== 'running') return;
+    countdownTimerId = setTimeout(() => {
+      countdownTimerId = 0;
+      countdownTick(seq);
+    }, COUNTDOWN_INTERVAL_MS);
+  }
+
+  function countdownTick(seq) {
+    if (seq !== countdownSeq) return;
+    if (!session || session.status !== 'running') {
+      stopCountdown();
+      return;
+    }
+    sendMessage({
+      type: 'ABRA_COUNTDOWN',
+      tabId: session.tabId,
+      token: session.token,
+      generation: session.generation
+    }).then((response) => {
+      if (seq !== countdownSeq) return;
+      if (!session || session.status !== 'running') {
+        stopCountdown();
+        return;
+      }
+      if (!response || response.ok !== true) {
+        // Refused (stale session) or the worker is restarting. Stop the fast
+        // heartbeat instead of hammering; the engine timer and the background
+        // watchdog keep their own cadence and the next attach restarts this.
+        stopCountdown();
+        return;
+      }
+      scheduleCountdown(seq);
+    });
+  }
+
+  function startCountdown() {
+    stopCountdown();
+    if (!session || session.status !== 'running') return;
+    scheduleCountdown(countdownSeq);
   }
 
   /* ---------------------------------------------------------------------- */
@@ -375,6 +441,9 @@
   function prepareReload() {
     rememberScroll();
     abortCycle();
+    // This document is about to be replaced; the next attach restarts the
+    // heartbeat in the fresh document.
+    stopCountdown();
     return { ok: true };
   }
 
@@ -402,6 +471,7 @@
     // The background refused this report (stale generation/token or a stopped
     // session). Never reload on an unvalidated answer.
     abortCycle();
+    stopCountdown();
     if (session) session.status = 'stopped';
     if (response && response.error) {
       try {
@@ -420,6 +490,7 @@
     const action = response.action;
     if (action === 'stop' || action === 'pause') {
       abortCycle();
+      stopCountdown();
       if (session) session.status = action === 'stop' ? 'stopped' : 'paused';
       return;
     }
@@ -752,6 +823,9 @@
       needsSettle = true;
       stopPicker();
       restoreScroll();
+      // Re-injection or a re-attach resets the heartbeat instead of stacking a
+      // second timer, and stops it when the attached status is not running.
+      startCountdown();
       if (session.status === 'running') {
         const delayMs = Math.max(0, Number(msg.delayMs) || 0);
         const seq = cycleSeq;
@@ -793,6 +867,8 @@
       const status = String(msg.status || 'stopped');
       abortCycle();
       if (session) session.status = status;
+      if (status === 'running') startCountdown();
+      else stopCountdown();
       if (status !== 'running') stopPicker();
       return Promise.resolve({ ok: true, status });
     }
@@ -828,23 +904,44 @@
   /* Visibility                                                             */
   /* ---------------------------------------------------------------------- */
 
+  /**
+   * The tab came back to the foreground (or was restored from the bfcache).
+   * Report it so the engine cadence resumes and restart the badge heartbeat.
+   */
+  function resumeVisible() {
+    if (!session || session.status !== 'running') return;
+    abortCycle();
+    report('visible').then((response) => {
+      if (response && response.ok === true && response.action === 'schedule') {
+        applyAction(response);
+        startCountdown();
+        return;
+      }
+      if (!response || response.ok !== true) stopCountdown();
+    });
+  }
+
   document.addEventListener(
     'visibilitychange',
     () => {
       if (!session || session.status !== 'running') return;
       if (document.hidden && session.config.pauseWhenHidden) {
         abortCycle();
+        stopCountdown();
         report('hidden');
         return;
       }
-      if (!document.hidden) {
-        abortCycle();
-        report('visible').then((response) => {
-          if (response && response.ok === true && response.action === 'schedule') {
-            applyAction(response);
-          }
-        });
-      }
+      if (!document.hidden) resumeVisible();
+    },
+    true
+  );
+
+  window.addEventListener(
+    'pageshow',
+    () => {
+      // bfcache restore: the document is alive again but its timers were
+      // stopped on pagehide, so bring the heartbeat back.
+      if (!document.hidden) startCountdown();
     },
     true
   );
@@ -853,6 +950,7 @@
     'pagehide',
     () => {
       abortCycle();
+      stopCountdown();
       stopPicker();
     },
     true

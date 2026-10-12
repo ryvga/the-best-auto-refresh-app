@@ -4,10 +4,24 @@
  *   sendMessage({ type: 'START', tabId, config })  -> { ok:true, state } | { ok:false, error }
  *   sendMessage({ type: 'STOP' | 'PAUSE' | 'RESUME' | 'GET_STATE' | 'PICK_ELEMENT', tabId })
  *   sendMessage({ type: 'GET_ALL' })               -> { ok:true, sessions: [] }
+ *   sendMessage({ type: 'ACTION_CAPABILITIES', tabId }) -> { ok:true, scriptAvailable, ... }
+ *   sendMessage({ type: 'ACTION_LOG', tabId })     -> { ok:true, entries: [] }
  *
  * Everything the user types is validated here before a START message is sent;
  * the engine validates independently as well.
+ *
+ * Automation (webhooks and page scripts) shares its schema with the engine
+ * through ./actions-core.js. This page never evaluates user code and never
+ * requests a permission on its own: the two Connect/Enable buttons are the only
+ * places that call chrome.permissions.request, and they do so inside the click.
  */
+
+import {
+  normalizeActions,
+  validateActions,
+  DEFAULT_ACTIONS,
+  permissionOriginForUrl
+} from './actions-core.js';
 
 'use strict';
 
@@ -23,6 +37,45 @@
   const MAX_SELECTOR_LENGTH = 1000;
   const TICK_MS = 1000;
   const NOTE_TIMEOUT_MS = 8000;
+
+  // Automation: activity polling only ever runs while the log disclosure is
+  // really open and the popup is visible, so a closed popup costs nothing.
+  const ACTIVITY_POLL_MS = 2000;
+  const URL_STATUS_DEBOUNCE_MS = 300;
+  const MAX_CODE_LENGTH = 20000;
+
+  // Display order and plain-language labels for the shared event list. The keys
+  // match ACTION_EVENTS in actions-core.js; the labels are what the user reads.
+  const ACTION_EVENT_LABELS = Object.freeze([
+    ['start', 'start'],
+    ['before-refresh', 'before refresh'],
+    ['after-refresh', 'after refresh'],
+    ['check', 'page checked'],
+    ['match', 'condition matched'],
+    ['limit', 'limit reached'],
+    ['manual-stop', 'manually stopped'],
+    ['error', 'error'],
+    ['pause', 'paused'],
+    ['resume', 'resumed']
+  ]);
+  const ACTION_EVENT_KEYS = ACTION_EVENT_LABELS.map(([key]) => key);
+
+  // The example is plain text placed in the textarea; it is never evaluated here.
+  const SCRIPT_EXAMPLE = [
+    "/* Example: highlight the page when a chosen event fires.",
+    " * `event` is a snapshot object passed to your code.",
+    " * Fields: type, refreshCount, status, timestamp,",
+    " *         and url/title/reason/keyword/selector when page details are on.",
+    " */",
+    "if (event.type === 'match' || event.type === 'after-refresh') {",
+    "  var box = document.createElement('div');",
+    "  box.textContent = 'Refresh event: ' + event.type + ' (#' + event.refreshCount + ')';",
+    "  box.style.cssText = 'position:fixed;z-index:2147483647;top:12px;left:12px;padding:8px 12px;' +",
+    "    'border-radius:8px;background:#102a2d;color:#32d5b0;font:600 13px system-ui,sans-serif';",
+    "  document.body.appendChild(box);",
+    "  setTimeout(function () { box.remove(); }, 6000);",
+    "}"
+  ].join('\n');
 
   const DEFAULT_CONFIG = Object.freeze({
     intervalMode: 'fixed',
@@ -40,7 +93,8 @@
     preserveScroll: true,
     bypassCache: false,
     pauseWhenHidden: false,
-    ignoreSelector: ''
+    ignoreSelector: '',
+    actions: DEFAULT_ACTIONS
   });
 
   const STOP_CONDITIONS = Object.freeze([
@@ -75,7 +129,16 @@
     'max-minutes',
     'keyword',
     'selector',
-    'ignore-selector'
+    'ignore-selector',
+    // Automation errors are reported through the same field machinery. Each id
+    // below has a matching #err-<id> node in the Automation disclosure.
+    'automation-webhook-url',
+    'automation-webhook-events',
+    'automation-webhook-headers',
+    'automation-webhook-body',
+    'automation-script-code',
+    'automation-script-events',
+    'automation'
   ];
 
   const PRESET_VALUES = ['10', '30', '60'];
@@ -83,8 +146,9 @@
   // Per-tab drafts. Each tab id gets its own key in chrome.storage.session, so
   // one window's unfinished edits never leak into another tab, and drafts vanish
   // when the browser closes. Values are kept exactly as typed: raw strings,
-  // radio choices, checkbox states and the Advanced disclosure state.
-  const DRAFT_VERSION = 1;
+  // radio choices, checkbox states, the Advanced disclosure state, and the raw
+  // automation fields (invalid JSON included) with their event selections.
+  const DRAFT_VERSION = 2;
   const DRAFT_KEY_PREFIX = 'popupDraft:';
   const DRAFT_TEXT_FIELDS = [
     'interval-seconds', 'min-seconds', 'max-seconds', 'settle-seconds',
@@ -95,6 +159,21 @@
   ];
   const DRAFT_PRESET_SET = new Set(PRESET_VALUES.concat('custom'));
   const DRAFT_MODE_SET = new Set(['fixed', 'random']);
+
+  // Saved profiles. Entries are { id, name, config, updatedAt, scope, target }:
+  //   scope  'global' | 'site' | 'page'  (legacy entries without a scope become
+  //          'global', so older saved profiles keep working everywhere)
+  //   target '' for global, the exact origin for site, origin+pathname+search
+  //          for page. Fragments are dropped, and a URL's username/password is
+  //          never copied into stored scope metadata.
+  const PROFILE_SCOPE_SET = new Set(['page', 'site', 'global']);
+  const PROFILE_SCOPE_NOUN = {
+    page: 'this page only',
+    site: 'this website',
+    global: 'everywhere'
+  };
+  const MAX_PROFILES = 200;
+  const MAX_PROFILE_NAME = 60;
 
   // ------------------------------------------------------------ environment
 
@@ -117,6 +196,15 @@
       hasOpenOptions:
         hasRuntime && typeof chrome.runtime.openOptionsPage === 'function',
       hasOptionsUrl: hasRuntime && typeof chrome.runtime.getURL === 'function',
+      // Optional-permission APIs. On an old build, or before the manifest
+      // declares optional permissions, these are simply absent: the automation
+      // card explains that instead of breaking.
+      hasPermissions: hasChrome && !!chrome.permissions
+        && typeof chrome.permissions.contains === 'function'
+        && typeof chrome.permissions.request === 'function'
+        && typeof chrome.permissions.getAll === 'function',
+      hasPermissionEvents: hasChrome && !!chrome.permissions
+        && !!chrome.permissions.onAdded && typeof chrome.permissions.onAdded.addListener === 'function',
       // Live means we can actually talk to the extension engine.
       live: hasRuntime && extensionId !== '' && hasChrome && !!chrome.tabs
     };
@@ -136,7 +224,22 @@
     'ignore-selector', 'case-sensitive', 'whole-word', 'preserve-scroll',
     'bypass-cache', 'pause-when-hidden', 'form-alert', 'primary-action',
     'stop-action', 'footer-note', 'save-default', 'stop-all',
-    'link-dashboard', 'link-help'
+    'link-dashboard', 'link-help',
+    'profile-card', 'profile-select-field', 'profile-select', 'profile-hint',
+    'profile-matched', 'profile-save', 'profile-save-form', 'profile-name',
+    'profile-scope', 'hint-profile-scope', 'err-profile-name',
+    'profile-save-alert', 'profile-save-action',
+    'automation', 'automation-summary-hint',
+    'automation-webhook', 'automation-webhook-enabled', 'automation-webhook-status',
+    'automation-webhook-fields', 'automation-webhook-url', 'automation-webhook-method',
+    'automation-webhook-connect', 'automation-webhook-connection', 'automation-webhook-events',
+    'automation-webhook-headers', 'automation-webhook-body', 'automation-webhook-details',
+    'automation-script', 'automation-script-enabled', 'automation-script-status',
+    'automation-script-fields', 'automation-script-code', 'automation-script-count',
+    'automation-script-example', 'automation-script-enable', 'automation-script-permission',
+    'automation-script-events',
+    'automation-activity', 'automation-activity-refresh', 'automation-activity-list',
+    'automation-manage-access'
   ];
   ids.forEach((id) => { ui[id] = document.getElementById(id); });
 
@@ -152,11 +255,25 @@
   let noteTimer = null;
   let inFlight = false;
   let busy = false;
+  let initializing = true;
   // formDirty records real user input so a late draft/default render can never
   // clobber it; draftWriteChain tracks dispatched writes before a draft is cleared.
   let formDirty = false;
   let restoringForm = false;
   let draftWriteChain = Promise.resolve();
+  // Saved profiles and the honest "which profile is loaded" line. currentProfile
+  // is only set when a profile was actually applied to the form, never when an
+  // unfinished per-tab draft was restored.
+  let savedProfiles = [];
+  let currentProfile = null;
+  let profileBusy = false;
+  // Automation status: one coalesced refresh per turn, plus a debounced URL
+  // re-check, and an activity timer that only exists while the log is open.
+  let automationStatusTimer = null;
+  let automationUrlTimer = null;
+  let activityTimer = null;
+  let activityBusy = false;
+  let lastFailedAt = 0;
 
   // ------------------------------------------------------------ small utils
 
@@ -257,7 +374,10 @@
       preserveScroll: source.preserveScroll !== false,
       bypassCache: source.bypassCache === true,
       pauseWhenHidden: source.pauseWhenHidden === true,
-      ignoreSelector: typeof source.ignoreSelector === 'string' ? source.ignoreSelector : ''
+      ignoreSelector: typeof source.ignoreSelector === 'string' ? source.ignoreSelector : '',
+      // The shared schema normaliser keeps automation on every round trip:
+      // defaults, drafts, profiles and the engine's own state.
+      actions: normalizeActions(source.actions)
     };
   }
 
@@ -270,6 +390,415 @@
     if (lower.startsWith('https://chrome.google.com/webstore')) return true;
     if (lower.startsWith('https://chromewebstore.google.com')) return true;
     return false;
+  }
+
+  // --------------------------------------------------------- profile scopes
+
+  /**
+   * Scope targets are derived from the parsed URL, never from the raw string,
+   * so credentials embedded in a URL can never reach storage and fragments are
+   * always dropped: site = origin, page = origin + pathname + search.
+   */
+  function parseHttpUrl(raw) {
+    if (typeof raw !== 'string' || raw === '') return null;
+    try {
+      const url = new URL(raw);
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+      return {
+        origin: url.origin,
+        pathname: url.pathname || '/',
+        search: url.search || ''
+      };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function scopeTarget(scope, raw) {
+    const parts = parseHttpUrl(raw);
+    if (!parts) return '';
+    if (scope === 'site') return parts.origin;
+    if (scope === 'page') return `${parts.origin}${parts.pathname}${parts.search}`;
+    return '';
+  }
+
+  function targetForScope(scope) {
+    return scopeTarget(scope, activeTab && activeTab.url);
+  }
+
+  function scopeLabel(scope, target) {
+    const noun = PROFILE_SCOPE_NOUN[scope] || PROFILE_SCOPE_NOUN.global;
+    if (scope === 'global' || !target) return noun;
+    const parts = parseHttpUrl(target);
+    const where = parts ? (scope === 'site' ? parts.origin : `${parts.origin}${parts.pathname}${parts.search}`) : target;
+    return `${noun} · ${where}`;
+  }
+
+  function normalizeScope(raw) {
+    return PROFILE_SCOPE_SET.has(raw) ? raw : 'global';
+  }
+
+  function normalizeProfileTarget(scope, raw) {
+    if (scope === 'global') return '';
+    if (typeof raw !== 'string' || raw === '') return '';
+    const parts = parseHttpUrl(raw);
+    if (!parts) return '';
+    return scope === 'site' ? parts.origin : `${parts.origin}${parts.pathname}${parts.search}`;
+  }
+
+  /** Reads the stored array defensively; legacy entries default to global. */
+  function readProfileList(raw) {
+    if (!Array.isArray(raw)) return [];
+    const profiles = [];
+    raw.forEach((item, index) => {
+      if (!item || typeof item !== 'object' || typeof item.name !== 'string' || item.name.trim() === '') return;
+      const scope = normalizeScope(item.scope);
+      profiles.push({
+        id: typeof item.id === 'string' && item.id ? item.id : `profile-${index}`,
+        name: item.name.trim().slice(0, MAX_PROFILE_NAME),
+        config: normalizeConfig(item.config),
+        updatedAt: Number.isFinite(item.updatedAt) ? item.updatedAt : null,
+        scope,
+        target: normalizeProfileTarget(scope, item.target)
+      });
+    });
+    return profiles;
+  }
+
+  function groupForProfile(profile, pageTarget, siteTarget) {
+    if (profile.scope === 'page') return profile.target && pageTarget && profile.target === pageTarget ? 'page' : 'other';
+    if (profile.scope === 'site') return profile.target && siteTarget && profile.target === siteTarget ? 'site' : 'other';
+    return 'global';
+  }
+
+  function byMostRecent(a, b) {
+    return (b.updatedAt || 0) - (a.updatedAt || 0);
+  }
+
+  /**
+   * Auto-match order on a first open with no draft: exact page, then exact
+   * site origin, then saved defaults. Global profiles are manually selected.
+   * Exact origin matching only — a suffix
+   * such as evil-example.com must never match example.com. Ties and multiples
+   * resolve to the most recently updated profile.
+   */
+  function matchProfileForTab() {
+    const pageTarget = targetForScope('page');
+    const siteTarget = targetForScope('site');
+    const groups = { page: [], site: [], global: [] };
+    savedProfiles.forEach((profile) => {
+      const group = groupForProfile(profile, pageTarget, siteTarget);
+      if (group !== 'other') groups[group].push(profile);
+    });
+    return (
+      groups.page.slice().sort(byMostRecent)[0]
+      || groups.site.slice().sort(byMostRecent)[0]
+      || null
+    );
+  }
+
+  /** Option values are data, not CSS selectors; keep the complete unique id. */
+  function optionValue(profile) {
+    return profile.id;
+  }
+
+  function findProfileByOptionValue(value) {
+    return savedProfiles.find((profile) => optionValue(profile) === value) || null;
+  }
+
+  function newProfileId() {
+    return `p_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+  }
+
+  // ------------------------------------------------------------- profile UI
+
+  function setProfileHint(node, profile) {
+    if (!node) return;
+    if (!profile || !PROFILE_SCOPE_SET.has(profile.scope)) {
+      node.textContent = '';
+      node.hidden = true;
+      node.removeAttribute('title');
+      return;
+    }
+    const noun = PROFILE_SCOPE_NOUN[profile.scope];
+    const where = profile.scope === 'global'
+      ? `“${profile.name}” applies ${noun}.`
+      : `“${profile.name}” is saved for ${scopeLabel(profile.scope, profile.target)}.`;
+    const automation = profileAutomationLabel(profile.config && profile.config.actions);
+    node.textContent = automation ? `${where} ${automation}` : where;
+    node.hidden = false;
+    node.removeAttribute('title');
+  }
+
+  function updateScopeHint() {
+    if (!ui['hint-profile-scope']) return;
+    const scope = ui['profile-scope'] ? ui['profile-scope'].value : 'global';
+    if (scope === 'global') {
+      ui['hint-profile-scope'].textContent = 'Everywhere: any tab you open, whichever site it is on.';
+      return;
+    }
+    const target = targetForScope(scope);
+    if (!target) {
+      ui['hint-profile-scope'].textContent = 'This tab has no web address, so only Everywhere can be saved from here.';
+      return;
+    }
+    ui['hint-profile-scope'].textContent = `${scopeLabel(scope, target)} — matching uses the whole address, so look-alike sites are not affected.`;
+  }
+
+  /** Greys out scoped choices when this tab has no usable web address. */
+  function syncScopeOptions() {
+    const select = ui['profile-scope'];
+    if (!select) return;
+    const usable = !pageRestricted && !!targetForScope('site');
+    for (const option of select.options) {
+      if (option.value === 'global') continue;
+      option.disabled = !usable;
+    }
+    if (!usable && select.value !== 'global') select.value = 'global';
+    updateScopeHint();
+  }
+
+  function setProfileSelectPlaceholder(text) {
+    const select = ui['profile-select'];
+    if (!select || select.options.length === 0) return;
+    select.options[0].textContent = text;
+  }
+
+  /** Rebuilds the grouped option list. Never changes the form or the draft. */
+  function renderProfileSelect() {
+    const select = ui['profile-select'];
+    if (!select) return;
+    const previous = select.value;
+    const pageTarget = targetForScope('page');
+    const siteTarget = targetForScope('site');
+    const groups = { page: [], site: [], global: [], other: [] };
+
+    savedProfiles.forEach((profile) => {
+      groups[groupForProfile(profile, pageTarget, siteTarget)].push(profile);
+    });
+
+    while (select.children.length > 1) select.lastElementChild.remove();
+
+    const headings = [
+      ['page', 'This page'],
+      ['site', 'This website'],
+      ['global', 'Everywhere'],
+      ['other', 'Other scopes']
+    ];
+    headings.forEach(([key, label]) => {
+      const list = groups[key].slice().sort(byMostRecent);
+      if (!list.length) return;
+      const group = document.createElement('optgroup');
+      group.label = label;
+      list.forEach((profile) => group.appendChild(profileOption(profile)));
+      select.appendChild(group);
+    });
+
+    const hasOptions = select.options.length > 1;
+    select.disabled = !hasOptions || profileBusy;
+    ui['profile-select-field'].hidden = !hasOptions;
+
+    if (previous && findProfileByOptionValue(previous)) select.value = previous;
+    else select.value = '';
+  }
+
+  function profileOption(profile) {
+    const option = document.createElement('option');
+    option.value = optionValue(profile);
+    option.textContent = profile.name;
+    option.dataset.scope = profile.scope;
+    option.dataset.target = profile.target;
+    option.dataset.name = profile.name;
+    return option;
+  }
+
+  function renderProfilesNote() {
+    if (!ui['profile-hint']) return;
+    if (!savedProfiles.length) {
+      ui['profile-hint'].textContent = 'Save this setup for a page, a website, or anywhere.';
+      return;
+    }
+    ui['profile-hint'].textContent = '';
+  }
+
+  function clearProfileAlert() {
+    if (!ui['profile-save-alert']) return;
+    ui['profile-save-alert'].hidden = true;
+    ui['profile-save-alert'].textContent = '';
+    if (ui['profile-name']) ui['profile-name'].removeAttribute('aria-invalid');
+    if (ui['err-profile-name']) {
+      ui['err-profile-name'].hidden = true;
+      ui['err-profile-name'].textContent = '';
+    }
+  }
+
+  function showProfileAlert(message) {
+    if (ui['err-profile-name']) {
+      ui['err-profile-name'].textContent = message;
+      ui['err-profile-name'].hidden = false;
+    }
+    if (ui['profile-name']) ui['profile-name'].setAttribute('aria-invalid', 'true');
+    if (ui['profile-save-alert']) {
+      ui['profile-save-alert'].textContent = message;
+      ui['profile-save-alert'].hidden = false;
+    }
+  }
+
+  function setProfileBusy(next) {
+    profileBusy = next;
+    if (ui['profile-select']) ui['profile-select'].disabled = next || ui['profile-select'].options.length <= 1;
+    if (ui['profile-save-action']) {
+      ui['profile-save-action'].disabled = next;
+      ui['profile-save-action'].setAttribute('aria-busy', next ? 'true' : 'false');
+    }
+  }
+
+  async function refreshProfiles() {
+    if (!env.hasStorage) {
+      savedProfiles = [];
+      renderProfileSelect();
+      renderProfilesNote();
+      return savedProfiles;
+    }
+    const stored = await storageGet(['profiles']);
+    savedProfiles = readProfileList(stored.profiles);
+    renderProfileSelect();
+    renderProfilesNote();
+    return savedProfiles;
+  }
+
+  // ------------------------------------------------------ profile applying
+
+  /**
+   * Applies a profile to the form and persists it as this tab's unfinished
+   * draft. It never starts refreshing, and it never touches saved defaults.
+   */
+  async function applyProfileToForm(profile, options) {
+    const opts = options || {};
+    if (!profile || (!opts.manual && formDirty)) return false;
+    restoringForm = true;
+    try {
+      applyConfigToForm(profile.config);
+    } finally {
+      restoringForm = false;
+    }
+
+    clearMatchedHint();
+    currentProfile = profile;
+    if (opts.manual) formDirty = true;
+
+    const select = ui['profile-select'];
+    if (select && !select.disabled) {
+      const value = optionValue(profile);
+      if (findProfileByOptionValue(value)) select.value = value;
+    }
+
+    // The matched line is written only after the form really holds the profile,
+    // so it can never claim a profile that a late edit already replaced.
+    setProfileHint(ui['profile-matched'], profile);
+    if (opts.note) setFooterNote(opts.note);
+    renderActions(currentState.status);
+    // Suggestions are not unfinished user edits. Save only an explicit choice,
+    // so a later update to a matching website/page profile is picked up.
+    if (opts.manual) await persistDraft();
+    return true;
+  }
+
+  function clearMatchedHint() {
+    currentProfile = null;
+    if (ui['profile-matched']) {
+      ui['profile-matched'].textContent = '';
+      ui['profile-matched'].hidden = true;
+    }
+    if (ui['profile-select']) ui['profile-select'].value = '';
+  }
+
+  function handleProfileSelection(event) {
+    const value = event.target.value;
+    if (!value) return;
+    const profile = findProfileByOptionValue(value);
+    if (!profile) return;
+    // Choosing a prompt on this open is informational: the profile is loaded
+    // as a draft, so nothing is claimed as auto-applied and nothing starts.
+    applyProfileToForm(profile, { manual: true, note: `Loaded “${profile.name}”. Use the action below to apply these settings.` });
+  }
+
+  // -------------------------------------------------------- profile saving
+
+  async function saveCurrentAsProfile() {
+    const nameRaw = ui['profile-name'] ? ui['profile-name'].value.trim() : '';
+    if (nameRaw === '') {
+      showProfileAlert('Give the profile a name first.');
+      if (ui['profile-name']) ui['profile-name'].focus();
+      return;
+    }
+
+    const scope = normalizeScope(ui['profile-scope'] ? ui['profile-scope'].value : 'global');
+    const target = scope === 'global' ? '' : targetForScope(scope);
+    if (scope !== 'global' && !target) {
+      showProfileAlert('This tab has no web address to scope a profile to. Choose Everywhere instead.');
+      if (ui['profile-scope']) ui['profile-scope'].focus();
+      return;
+    }
+
+    const { config, errors } = collectForm();
+    if (errors.length) {
+      showErrors(errors);
+      return;
+    }
+    clearProfileAlert();
+    updateScopeHint();
+
+    if (!env.hasStorage) {
+      previewMessage();
+      return;
+    }
+
+    setProfileBusy(true);
+    try {
+      const stored = await storageGet(['profiles']);
+      const profiles = readProfileList(stored.profiles);
+      const nameKey = nameRaw.toLowerCase();
+      // Same name + scope + target updates in place; a different scope or
+      // target is a genuinely new profile and is saved alongside.
+      const duplicate = profiles.find(
+        (profile) => profile.name.toLowerCase() === nameKey && profile.scope === scope && profile.target === target
+      );
+      if (!duplicate && profiles.length >= MAX_PROFILES) {
+        showProfileAlert('You have 200 profiles. Remove an unused profile from the dashboard before adding another.');
+        return;
+      }
+      const entry = {
+        id: duplicate ? duplicate.id : newProfileId(),
+        name: nameRaw.slice(0, MAX_PROFILE_NAME),
+        config,
+        updatedAt: Date.now(),
+        scope,
+        target
+      };
+      const next = duplicate
+        ? profiles.map((profile) => (profile.id === duplicate.id ? entry : profile))
+        : profiles.concat(entry);
+
+      const saved = await storageSet({ profiles: next });
+      if (!saved) {
+        showProfileAlert('That profile could not be saved.');
+        return;
+      }
+
+      savedProfiles = next;
+      renderProfileSelect();
+      renderProfilesNote();
+      const select = ui['profile-select'];
+      const value = optionValue(entry);
+      if (select && findProfileByOptionValue(value)) select.value = value;
+      if (ui['profile-name']) ui['profile-name'].value = '';
+      setFooterNote(duplicate
+        ? `Updated the profile “${entry.name}” (${PROFILE_SCOPE_NOUN[scope]}).`
+        : `Saved the profile “${entry.name}” (${PROFILE_SCOPE_NOUN[scope]}).`);
+    } finally {
+      setProfileBusy(false);
+    }
   }
 
   // -------------------------------------------------------------- messaging
@@ -463,7 +992,11 @@
       stopCondition: ui['stop-condition'] ? ui['stop-condition'].value : null,
       values,
       checks,
-      advancedOpen: !!(ui.advanced && ui.advanced.open)
+      advancedOpen: !!(ui.advanced && ui.advanced.open),
+      // Raw automation, never normalised: a half-typed header object or an
+      // incomplete URL has to come back exactly as it was left.
+      actions: readActionsRawFromForm(),
+      automationOpen: !!(ui.automation && ui.automation.open)
     };
   }
 
@@ -492,8 +1025,13 @@
       ui['stop-condition'].value = draft.stopCondition;
     }
     if (ui.advanced) ui.advanced.open = draft.advancedOpen === true;
+    // Drafts written before automation existed simply leave the automation form
+    // holding whatever the defaults or the matched profile put there.
+    if (draft.actions && typeof draft.actions === 'object') applyActionsRawToForm(draft.actions);
+    if (ui.automation) ui.automation.open = draft.automationOpen === true;
 
     syncConditionalPanels();
+    syncAutomationPanels();
     return true;
   }
 
@@ -537,13 +1075,19 @@
     } finally {
       restoringForm = false;
     }
+    // The restored draft wins over any saved profile, so no profile may still
+    // be described as the one in charge of this form.
+    clearMatchedHint();
     return true;
   }
 
   function handleFormEdit() {
     formDirty = true;
     if (restoringForm) return;
+    // Real typing means the form is no longer exactly the matched profile.
+    clearMatchedHint();
     persistDraft();
+    renderActions(currentState.status);
   }
 
   // ------------------------------------------------------------------ render
@@ -644,15 +1188,25 @@
     ui['countdown-note'].textContent = config.intervalMode === 'random' ? 'estimated, random' : 'estimated';
   }
 
+  function hasPendingSettings() {
+    if (!['running', 'paused'].includes(currentState.status)) return false;
+    const { config, errors } = collectForm();
+    return errors.length === 0
+      && JSON.stringify(config) !== JSON.stringify(normalizeConfig(currentState.config));
+  }
+
   function renderActions(status) {
     let label = 'Start';
-    if (status === 'running') label = 'Pause';
+    if (hasPendingSettings()) label = 'Apply & restart';
+    else if (status === 'running') label = 'Pause';
     else if (status === 'paused') label = 'Resume';
 
     ui['primary-action'].textContent = busy ? `${label}…` : label;
-    ui['primary-action'].disabled = busy || pageRestricted;
+    ui['primary-action'].disabled = busy || pageRestricted || initializing;
     ui['primary-action'].setAttribute('aria-busy', busy ? 'true' : 'false');
-    ui['primary-action'].title = label === 'Start'
+    ui['primary-action'].title = label === 'Apply & restart'
+      ? 'Restart this tab’s monitor with the settings shown below'
+      : label === 'Start'
       ? 'Start refreshing this tab'
       : label === 'Pause'
         ? 'Pause refreshing this tab'
@@ -784,13 +1338,18 @@
 
     const first = el(errors[0].id);
     if (first && ui.advanced.contains(first)) ui.advanced.open = true;
+    // An automation problem must be visible rather than hidden behind a closed
+    // disclosure, so the card opens before the first bad field is focused.
+    if (errors.some((error) => String(error.id).startsWith('automation'))) {
+      openAutomationDisclosure();
+    }
 
     ui['form-alert'].textContent = errors.length === 1
       ? `Please fix one field: ${errors[0].message}`
       : `Please fix ${errors.length} fields before starting.`;
     ui['form-alert'].hidden = false;
 
-    if (first && typeof first.focus === 'function') first.focus();
+    focusErrorTarget(errors[0].id);
   }
 
   function readInteger(fieldId, min, max, message, errors) {
@@ -891,6 +1450,39 @@
       errors.push({ id: 'ignore-selector', message: `Keep the selector under ${MAX_SELECTOR_LENGTH} characters.` });
     }
 
+    const rawActions = collectActionsForm();
+    let validated = null;
+    try {
+      validated = validateActions(rawActions);
+    } catch (error) {
+      validated = null;
+    }
+    if (!validated || typeof validated !== 'object') {
+      // The shared validator is unreachable. The engine validates again when
+      // START arrives, so keep the form usable instead of blocking everything.
+      validated = { ok: true, actions: normalizeActions(rawActions), errors: [] };
+    }
+    if (validated.ok !== true) {
+      const actionErrors = Array.isArray(validated.errors) ? validated.errors : [];
+      if (actionErrors.length) {
+        actionErrors.forEach((item) => {
+          errors.push({
+            id: actionErrorFieldId(item && item.field),
+            message: item && typeof item.message === 'string' && item.message
+              ? item.message
+              : 'Check this automation setting.'
+          });
+        });
+      } else {
+        errors.push({
+          id: 'automation',
+          message: typeof validated.error === 'string' && validated.error
+            ? validated.error
+            : 'Check the automation settings.'
+        });
+      }
+    }
+
     const config = normalizeConfig({
       intervalMode,
       intervalSeconds,
@@ -907,7 +1499,8 @@
       preserveScroll: ui['preserve-scroll'].checked,
       bypassCache: ui['bypass-cache'].checked,
       pauseWhenHidden: ui['pause-when-hidden'].checked,
-      ignoreSelector
+      ignoreSelector,
+      actions: validated.ok === true && validated.actions ? validated.actions : rawActions
     });
 
     return { config, errors };
@@ -938,6 +1531,7 @@
     ui['pause-when-hidden'].checked = config.pauseWhenHidden;
     ui['ignore-selector'].value = config.ignoreSelector;
 
+    applyActionsToForm(config.actions);
     syncConditionalPanels();
   }
 
@@ -954,6 +1548,690 @@
     const condition = ui['stop-condition'].value;
     ui['keyword-panel'].hidden = !KEYWORD_CONDITIONS.has(condition);
     ui['selector-panel'].hidden = !SELECTOR_CONDITIONS.has(condition);
+  }
+
+  // -------------------------------------------------------------- automation
+  //
+  // Webhooks and page scripts share their schema with the engine through
+  // ./actions-core.js. This page never evaluates user code, never fetches a
+  // user URL, and never asks for a permission outside the two explicit buttons
+  // below (each of which calls chrome.permissions.request synchronously inside
+  // the click, before any await, so the click is the user gesture).
+
+  function setCheck(input, value) {
+    if (input) input.checked = value === true;
+  }
+
+  function asText(value, fallback) {
+    if (typeof value === 'string') return value;
+    if (value === null || value === undefined) return fallback;
+    try {
+      return JSON.stringify(value, null, 2);
+    } catch (error) {
+      return fallback;
+    }
+  }
+
+  function setPill(node, status, text) {
+    if (!node) return;
+    node.dataset.status = status;
+    node.textContent = text;
+  }
+
+  function setStatusLine(node, text, variant) {
+    if (!node) return;
+    node.textContent = text || '';
+    node.className = 'status-line' + (variant ? ` ${variant}` : '');
+  }
+
+  /** Builds both compact event grids from one shared order and label list. */
+  function buildEventGrids() {
+    [['webhook', ui['automation-webhook-events']], ['script', ui['automation-script-events']]]
+      .forEach(([kind, container]) => {
+        if (!container) return;
+        while (container.firstChild) container.removeChild(container.firstChild);
+        ACTION_EVENT_LABELS.forEach(([key, label]) => {
+          const input = document.createElement('input');
+          input.type = 'checkbox';
+          input.id = `automation-${kind}-event-${key}`;
+          input.name = `automation-${kind}-event`;
+          input.value = key;
+          const row = document.createElement('label');
+          row.className = 'event-check';
+          row.setAttribute('for', input.id);
+          const text = document.createElement('span');
+          text.textContent = label;
+          row.append(input, text);
+          container.appendChild(row);
+        });
+        const defaults = DEFAULT_ACTIONS && DEFAULT_ACTIONS[kind];
+        setSelectedEvents(kind, defaults && Array.isArray(defaults.events) ? defaults.events : ['match']);
+      });
+  }
+
+  /** The selected event keys, always in the shared order. */
+  function selectedEvents(kind) {
+    return ACTION_EVENT_KEYS.filter((key) => {
+      const input = el(`automation-${kind}-event-${key}`);
+      return !!(input && input.checked);
+    });
+  }
+
+  function setSelectedEvents(kind, list) {
+    const wanted = new Set(Array.isArray(list) ? list : []);
+    ACTION_EVENT_KEYS.forEach((key) => {
+      const input = el(`automation-${kind}-event-${key}`);
+      if (input) input.checked = wanted.has(key);
+    });
+  }
+
+  /** Raw automation form values, exactly as typed (invalid JSON included). */
+  function readActionsRawFromForm() {
+    return {
+      webhook: {
+        enabled: !!(ui['automation-webhook-enabled'] && ui['automation-webhook-enabled'].checked),
+        url: ui['automation-webhook-url'] ? ui['automation-webhook-url'].value : '',
+        method: ui['automation-webhook-method'] ? ui['automation-webhook-method'].value : 'POST',
+        headers: ui['automation-webhook-headers'] ? ui['automation-webhook-headers'].value : '{}',
+        body: ui['automation-webhook-body'] ? ui['automation-webhook-body'].value : '',
+        includePageDetails: !!(ui['automation-webhook-details'] && ui['automation-webhook-details'].checked),
+        events: selectedEvents('webhook')
+      },
+      script: {
+        enabled: !!(ui['automation-script-enabled'] && ui['automation-script-enabled'].checked),
+        events: selectedEvents('script'),
+        code: ui['automation-script-code'] ? ui['automation-script-code'].value : '',
+        world: 'USER_SCRIPT'
+      }
+    };
+  }
+
+  /** Restores a per-tab draft's raw automation values without cleaning them. */
+  function applyActionsRawToForm(raw) {
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const webhook = source.webhook && typeof source.webhook === 'object' ? source.webhook : {};
+    const script = source.script && typeof source.script === 'object' ? source.script : {};
+
+    setCheck(ui['automation-webhook-enabled'], webhook.enabled === true);
+    if (ui['automation-webhook-url'] && typeof webhook.url === 'string') {
+      ui['automation-webhook-url'].value = webhook.url;
+    }
+    if (ui['automation-webhook-method'] && typeof webhook.method === 'string'
+      && (webhook.method === 'GET' || webhook.method === 'POST')) {
+      ui['automation-webhook-method'].value = webhook.method;
+    }
+    if (ui['automation-webhook-headers'] && typeof webhook.headers === 'string') {
+      ui['automation-webhook-headers'].value = webhook.headers;
+    }
+    if (ui['automation-webhook-body'] && typeof webhook.body === 'string') {
+      ui['automation-webhook-body'].value = webhook.body;
+    }
+    setCheck(ui['automation-webhook-details'], webhook.includePageDetails === true);
+    if (Array.isArray(webhook.events)) setSelectedEvents('webhook', webhook.events);
+
+    setCheck(ui['automation-script-enabled'], script.enabled === true);
+    if (ui['automation-script-code'] && typeof script.code === 'string') {
+      ui['automation-script-code'].value = script.code;
+    }
+    if (Array.isArray(script.events)) setSelectedEvents('script', script.events);
+
+    syncAutomationPanels();
+  }
+
+  /** Writes shared-schema actions (defaults, profiles, engine state) into the form. */
+  function applyActionsToForm(raw) {
+    const actions = normalizeActions(raw);
+    const webhook = actions.webhook;
+    const script = actions.script;
+
+    setCheck(ui['automation-webhook-enabled'], webhook.enabled);
+    if (ui['automation-webhook-url']) ui['automation-webhook-url'].value = asText(webhook.url, '');
+    if (ui['automation-webhook-method']) ui['automation-webhook-method'].value = webhook.method === 'GET' ? 'GET' : 'POST';
+    if (ui['automation-webhook-headers']) ui['automation-webhook-headers'].value = asText(webhook.headers, '{}');
+    if (ui['automation-webhook-body']) ui['automation-webhook-body'].value = asText(webhook.body, '');
+    setCheck(ui['automation-webhook-details'], webhook.includePageDetails);
+    setSelectedEvents('webhook', webhook.events);
+
+    setCheck(ui['automation-script-enabled'], script.enabled);
+    if (ui['automation-script-code']) ui['automation-script-code'].value = asText(script.code, '');
+    setSelectedEvents('script', script.events);
+
+    syncAutomationPanels();
+    scheduleAutomationStatus();
+  }
+
+  /** Trimmed form values handed to the shared validator on Start/Save. */
+  function collectActionsForm() {
+    const raw = readActionsRawFromForm();
+    raw.webhook.url = raw.webhook.url.trim();
+    return raw;
+  }
+
+  function updateCodeCount() {
+    if (!ui['automation-script-count'] || !ui['automation-script-code']) return;
+    const length = ui['automation-script-code'].value.length;
+    ui['automation-script-count'].textContent = `${length} / ${MAX_CODE_LENGTH}`;
+  }
+
+  /** Visual only: which sections are open plus the summary hint and counter. */
+  function syncAutomationPanels() {
+    const webhookOn = !!(ui['automation-webhook-enabled'] && ui['automation-webhook-enabled'].checked);
+    const scriptOn = !!(ui['automation-script-enabled'] && ui['automation-script-enabled'].checked);
+
+    if (ui['automation-webhook-fields']) ui['automation-webhook-fields'].hidden = !webhookOn;
+    if (ui['automation-script-fields']) ui['automation-script-fields'].hidden = !scriptOn;
+
+    const parts = [];
+    if (webhookOn) parts.push('webhook');
+    if (scriptOn) parts.push('script');
+    if (ui['automation-summary-hint']) {
+      ui['automation-summary-hint'].textContent = parts.length
+        ? `${parts.join(' + ')} on`
+        : 'webhooks & page scripts · off';
+    }
+    updateCodeCount();
+  }
+
+  function openAutomationDisclosure() {
+    if (!ui.automation) return;
+    ui.automation.open = true;
+    syncAutomationPanels();
+    scheduleAutomationStatus();
+  }
+
+  /** Short "includes automation" sentence used by profile hints. */
+  function profileAutomationLabel(raw) {
+    const actions = normalizeActions(raw);
+    const parts = [];
+    if (actions.webhook.enabled) parts.push('a webhook');
+    if (actions.script.enabled) parts.push('a page script');
+    if (!parts.length) return '';
+    return `Includes ${parts.join(' and ')}.`;
+  }
+
+  /** Turns a shared-validator field name into a real field id in this form. */
+  function actionErrorFieldId(field) {
+    const raw = typeof field === 'string' ? field.toLowerCase() : '';
+    const kind = raw.indexOf('script') === 0 ? 'script' : 'webhook';
+    if (raw.indexOf('event') !== -1) return `automation-${kind}-events`;
+    if (raw.indexOf('header') !== -1) return 'automation-webhook-headers';
+    if (raw.indexOf('body') !== -1 || raw.indexOf('payload') !== -1) return 'automation-webhook-body';
+    if (raw.indexOf('url') !== -1 || raw.indexOf('origin') !== -1) return 'automation-webhook-url';
+    if (raw.indexOf('code') !== -1 || raw.indexOf('world') !== -1) return 'automation-script-code';
+    return 'automation';
+  }
+
+  function focusErrorTarget(id) {
+    if (id === 'automation') {
+      const summary = ui.automation ? ui.automation.querySelector('summary') : null;
+      if (summary && typeof summary.focus === 'function') {
+        summary.focus();
+        return;
+      }
+    }
+    const node = el(id);
+    if (node && typeof node.focus === 'function') node.focus();
+  }
+
+  // ------------------------------------------------- automation status checks
+
+  /** One coalesced status refresh per turn, so typing never spams the engine. */
+  function scheduleAutomationStatus() {
+    if (automationStatusTimer) return;
+    automationStatusTimer = setTimeout(() => {
+      automationStatusTimer = null;
+      refreshWebhookIndicator();
+      refreshScriptIndicator();
+    }, 0);
+  }
+
+  function scheduleAutomationUrlStatus() {
+    if (automationUrlTimer) clearTimeout(automationUrlTimer);
+    automationUrlTimer = setTimeout(() => {
+      automationUrlTimer = null;
+      refreshWebhookIndicator();
+    }, URL_STATUS_DEBOUNCE_MS);
+  }
+
+  /** Parses the URL box into a permission pattern; never requests anything. */
+  function webhookPattern() {
+    const input = ui['automation-webhook-url'];
+    if (!input) return { pattern: '', reason: 'invalid' };
+    const raw = input.value.trim();
+    if (raw === '') return { pattern: '', reason: 'empty' };
+    let pattern = '';
+    try {
+      pattern = permissionOriginForUrl(raw);
+    } catch (error) {
+      pattern = '';
+    }
+    if (typeof pattern !== 'string' || pattern === '') return { pattern: '', reason: 'invalid' };
+    return { pattern, reason: 'ok' };
+  }
+
+  function hostLabelOf(pattern) {
+    return String(pattern).replace(/^[a-z]+:\/\//i, '').replace(/\/\*$/, '').replace(/\/$/, '');
+  }
+
+  function checkOriginPermission(pattern) {
+    return new Promise((resolve) => {
+      if (!env.hasPermissions) {
+        resolve(null);
+        return;
+      }
+      try {
+        chrome.permissions.contains({ origins: [pattern] }, (granted) => {
+          const failed = chrome.runtime && chrome.runtime.lastError;
+          resolve(failed ? null : granted === true);
+        });
+      } catch (error) {
+        resolve(null);
+      }
+    });
+  }
+
+  function refreshWebhookIndicator() {
+    const status = ui['automation-webhook-status'];
+    const line = ui['automation-webhook-connection'];
+    const enabled = !!(ui['automation-webhook-enabled'] && ui['automation-webhook-enabled'].checked);
+
+    if (!enabled) {
+      setPill(status, 'off', 'Off');
+      setStatusLine(line, 'Webhook is off, so nothing is sent and no permission is involved in normal refreshing.', '');
+      return;
+    }
+    if (!env.live) {
+      setPill(status, 'unavailable', 'Preview');
+      setStatusLine(line, 'Preview only — granted access cannot be read from this page.', '');
+      return;
+    }
+    if (!env.hasPermissions) {
+      setPill(status, 'unavailable', 'No API');
+      setStatusLine(line, 'This browser build does not expose chrome.permissions, so webhook access cannot be checked or granted here.', 'is-error');
+      return;
+    }
+
+    const { pattern, reason } = webhookPattern();
+    if (reason === 'empty') {
+      setPill(status, 'unavailable', 'Needs URL');
+      setStatusLine(line, 'Add the webhook URL above, then press Connect webhook.', '');
+      return;
+    }
+    if (reason !== 'ok') {
+      setPill(status, 'error', 'Bad URL');
+      setStatusLine(line, 'That is not a usable webhook address. Use http or https, remove any username or password from it, and remember that plain http is only allowed for local development hosts such as localhost or 127.0.0.1.', 'is-error');
+      return;
+    }
+
+    const host = hostLabelOf(pattern);
+    setPill(status, 'unavailable', 'Checking');
+    checkOriginPermission(pattern).then((granted) => {
+      if (granted === null) {
+        setPill(status, 'unavailable', 'Unknown');
+        setStatusLine(line, 'Access for this hostname could not be checked.', '');
+        return;
+      }
+      if (granted) {
+        setPill(status, 'ready', 'Connected');
+        setStatusLine(line, `Access granted for ${host} (the port is ignored, so the whole hostname is allowed).`, 'is-success');
+      } else {
+        setPill(status, 'unavailable', 'Not connected');
+        setStatusLine(line, `Press Connect webhook to allow ${host} (port ignored). That button only grants access.`, '');
+      }
+    });
+  }
+
+  async function loadScriptCapabilities() {
+    if (!env.live || !activeTab || typeof activeTab.id !== 'number') return null;
+    const response = await sendMessage({ type: 'ACTION_CAPABILITIES', tabId: activeTab.id });
+    if (!response || typeof response !== 'object' || response.ok !== true) return null;
+    return response;
+  }
+
+  const SCRIPT_SWITCH_HELP = 'Chrome 138 and later also needs “Allow User Scripts” switched on by hand in chrome://extensions → this extension → Details; that security switch cannot be opened for you.';
+
+  function refreshScriptIndicator() {
+    const status = ui['automation-script-status'];
+    const line = ui['automation-script-permission'];
+    const enabled = !!(ui['automation-script-enabled'] && ui['automation-script-enabled'].checked);
+
+    if (!enabled) {
+      setPill(status, 'off', 'Off');
+      setStatusLine(line, 'JavaScript automation is off. No permission is involved in normal refreshing.', '');
+      return;
+    }
+    if (!env.live) {
+      setPill(status, 'unavailable', 'Preview');
+      setStatusLine(line, 'Preview only — script access cannot be read from this page.', '');
+      return;
+    }
+    if (!activeTab || typeof activeTab.id !== 'number') {
+      setPill(status, 'unavailable', 'No tab');
+      setStatusLine(line, 'Open a normal website tab to check script access for it.', '');
+      return;
+    }
+
+    setPill(status, 'unavailable', 'Checking');
+    loadScriptCapabilities().then((capabilities) => {
+      if (!capabilities) {
+        setPill(status, 'unavailable', 'Unknown');
+        setStatusLine(line, 'Script access could not be checked. Reload the extension, then reopen this popup.', '');
+        return;
+      }
+      const message = typeof capabilities.message === 'string' && capabilities.message ? `${capabilities.message} ` : '';
+      if (capabilities.scriptPermission !== true) {
+        setPill(status, 'unavailable', 'Not enabled');
+        setStatusLine(line, `Press Enable JavaScript on this website to ask for the userScripts permission. ${SCRIPT_SWITCH_HELP}`, '');
+        return;
+      }
+      if (capabilities.scriptOriginGranted !== true) {
+        setPill(status, 'unavailable', 'Other site');
+        setStatusLine(line, `${message}Access is granted, but not for this page’s hostname. Press Enable JavaScript on this website while this tab is in front.`, '');
+        return;
+      }
+      if (capabilities.scriptAvailable !== true) {
+        setPill(status, 'unavailable', 'Check switch');
+        setStatusLine(line, `${message}${SCRIPT_SWITCH_HELP}`, '');
+        return;
+      }
+      setPill(status, 'ready', 'Ready');
+      setStatusLine(line, `${message}Ready to run on this website for the events you chose. ${SCRIPT_SWITCH_HELP}`, '');
+    });
+  }
+
+  // ----------------------------------------------- explicit permission buttons
+
+  function connectWebhook() {
+    const status = ui['automation-webhook-status'];
+    const line = ui['automation-webhook-connection'];
+
+    if (!env.live) {
+      setStatusLine(line, 'Preview only — the extension engine is not reachable here.', '');
+      return;
+    }
+    if (!env.hasPermissions) {
+      setStatusLine(line, 'This browser build does not expose chrome.permissions, so access cannot be requested here.', 'is-error');
+      return;
+    }
+
+    const { pattern, reason } = webhookPattern();
+    if (reason !== 'ok') {
+      setStatusLine(line, reason === 'empty'
+        ? 'Add the webhook URL first.'
+        : 'Enter a complete http or https address with no username or password. Plain http is only allowed for local development hosts such as localhost or 127.0.0.1.', 'is-error');
+      if (ui['automation-webhook-url'] && typeof ui['automation-webhook-url'].focus === 'function') {
+        ui['automation-webhook-url'].focus();
+      }
+      return;
+    }
+
+    setPill(status, 'unavailable', 'Asking');
+    setStatusLine(line, 'Waiting for your answer in the browser’s permission prompt…', '');
+
+    // The request starts synchronously inside this click, before any await, so
+    // the click counts as the user gesture. This button grants access only: no
+    // request is ever sent to the webhook URL from here.
+    try {
+      chrome.permissions.request({ origins: [pattern] }, (granted) => {
+        const failed = chrome.runtime && chrome.runtime.lastError;
+        if (failed) {
+          setPill(status, 'error', 'Failed');
+          setStatusLine(line, failed.message || 'The permission request failed.', 'is-error');
+          return;
+        }
+        if (granted !== true) {
+          setPill(status, 'unavailable', 'Not connected');
+          setStatusLine(line, 'Access was not granted, so no webhook will be sent. You can try again at any time.', '');
+          return;
+        }
+        scheduleAutomationStatus();
+        setFooterNote('Webhook access granted. Nothing has been sent.');
+      });
+    } catch (error) {
+      setPill(status, 'error', 'Failed');
+      setStatusLine(line, (error && error.message) || 'The permission request could not be started.', 'is-error');
+    }
+  }
+
+  function enableScriptOnSite() {
+    const status = ui['automation-script-status'];
+    const line = ui['automation-script-permission'];
+
+    if (!env.live) {
+      setStatusLine(line, 'Preview only — the extension engine is not reachable here.', '');
+      return;
+    }
+    if (!env.hasPermissions) {
+      setStatusLine(line, 'This browser build does not expose chrome.permissions, so access cannot be requested here.', 'is-error');
+      return;
+    }
+
+    const url = activeTab && typeof activeTab.url === 'string' ? activeTab.url : '';
+    let pattern = '';
+    try {
+      pattern = permissionOriginForUrl(url);
+    } catch (error) {
+      pattern = '';
+    }
+    if (typeof pattern !== 'string' || pattern === '') {
+      setStatusLine(line, 'Put a normal http or https page in front and press again. Browser pages, the Web Store and local files cannot be scripted.', 'is-error');
+      return;
+    }
+
+    setPill(status, 'unavailable', 'Asking');
+    setStatusLine(line, 'Waiting for your answer in the browser’s permission prompt…', '');
+
+    // Same gesture rule as the webhook button, and the same restraint: this
+    // grants access, and the Chrome 138+ "Allow User Scripts" switch is only
+    // ever described, never toggled for the user.
+    try {
+      chrome.permissions.request({ permissions: ['userScripts'], origins: [pattern] }, (granted) => {
+        const failed = chrome.runtime && chrome.runtime.lastError;
+        if (failed) {
+          setPill(status, 'error', 'Failed');
+          setStatusLine(line, failed.message || 'The permission request failed.', 'is-error');
+          return;
+        }
+        if (granted !== true) {
+          setPill(status, 'unavailable', 'Not enabled');
+          setStatusLine(line, 'Access was not granted, so no script will run. You can try again at any time.', '');
+          return;
+        }
+        loadScriptCapabilities().then((capabilities) => {
+          const message = capabilities && typeof capabilities.message === 'string' && capabilities.message
+            ? `${capabilities.message} `
+            : '';
+          const ready = !!(capabilities && capabilities.scriptAvailable === true
+            && capabilities.scriptPermission === true
+            && capabilities.scriptOriginGranted === true);
+          setPill(status, ready ? 'ready' : 'unavailable', ready ? 'Ready' : 'Check switch');
+          setStatusLine(line, `${message}${SCRIPT_SWITCH_HELP}`, ready ? 'is-success' : '');
+        });
+        setFooterNote('JavaScript access granted for this website.');
+      });
+    } catch (error) {
+      setPill(status, 'error', 'Failed');
+      setStatusLine(line, (error && error.message) || 'The permission request could not be started.', 'is-error');
+    }
+  }
+
+  function insertExampleSnippet() {
+    const area = ui['automation-script-code'];
+    if (!area) return;
+    const existing = area.value;
+    area.value = existing.trim() === ''
+      ? SCRIPT_EXAMPLE
+      : `${existing.replace(/\s+$/, '')}\n\n${SCRIPT_EXAMPLE}`;
+    updateCodeCount();
+    handleFormEdit();
+    if (typeof area.focus === 'function') area.focus();
+    if (typeof area.setSelectionRange === 'function') {
+      try {
+        const end = area.value.length;
+        area.setSelectionRange(end, end);
+      } catch (error) {
+        /* Not fatal: the snippet is already in the box. */
+      }
+    }
+    setFooterNote('Example snippet added. Nothing runs until you press Start.');
+  }
+
+  function openAutomationAccess() {
+    if (openOptions('#automation')) {
+      setFooterNote('Opened the dashboard at Automation access.');
+      return;
+    }
+    setFooterNote('The dashboard could not be opened from here.');
+  }
+
+  // -------------------------------------------------------- activity (log)
+
+  async function fetchActivityEntries() {
+    if (!env.live || !activeTab || typeof activeTab.id !== 'number') return null;
+    const response = await sendMessage({ type: 'ACTION_LOG', tabId: activeTab.id });
+    if (!response || typeof response !== 'object' || response.ok !== true) return null;
+    return Array.isArray(response.entries) ? response.entries : [];
+  }
+
+  async function loadActivity() {
+    if (activityBusy) return;
+    activityBusy = true;
+    try {
+      const entries = await fetchActivityEntries();
+      renderActivity(entries);
+      announceActivityFailures(entries);
+    } finally {
+      activityBusy = false;
+    }
+  }
+
+  /**
+   * A failed hook is surfaced once instead of being swallowed, and it never
+   * stops refreshing: the engine keeps the monitor running and only logs it.
+   */
+  function announceActivityFailures(entries) {
+    if (!Array.isArray(entries) || !entries.length) return;
+    const failed = entries.filter((entry) => entry && entry.status === 'failed');
+    if (!failed.length) return;
+    const newest = failed.reduce((max, entry) => (
+      Number.isFinite(entry.timestamp) && entry.timestamp > max ? entry.timestamp : max
+    ), 0);
+    if (newest <= lastFailedAt) return;
+    lastFailedAt = newest;
+    setFooterNote('An automation hook failed. Open Automation → Recent activity for the log; refreshing continues.');
+  }
+
+  function activityEventLabel(event) {
+    const found = ACTION_EVENT_LABELS.find(([key]) => key === event);
+    if (found) return found[1];
+    return typeof event === 'string' && event ? event : 'event';
+  }
+
+  function activityKindLabel(kind) {
+    if (kind === 'webhook') return 'webhook';
+    if (kind === 'script') return 'JavaScript';
+    return typeof kind === 'string' && kind ? kind : 'automation';
+  }
+
+  function activityStatusLabel(status) {
+    if (status === 'success') return 'ok';
+    if (status === 'failed') return 'failed';
+    if (status === 'skipped') return 'skipped';
+    return typeof status === 'string' ? status : '';
+  }
+
+  function activityItem(when, what, variant, message) {
+    const item = document.createElement('li');
+    item.className = 'activity-item' + (variant ? ` ${variant}` : '');
+    if (when) {
+      const time = document.createElement('span');
+      time.className = 'activity-when';
+      time.textContent = when;
+      item.appendChild(time);
+    }
+    const label = document.createElement('span');
+    label.className = 'activity-what';
+    label.textContent = what;
+    item.appendChild(label);
+    if (message) {
+      const detail = document.createElement('span');
+      detail.className = 'activity-detail';
+      detail.textContent = message;
+      item.appendChild(detail);
+    }
+    return item;
+  }
+
+  /** Renders the newest ten entries using textContent only. */
+  function renderActivity(entries) {
+    const list = ui['automation-activity-list'];
+    if (!list) return;
+    while (list.firstChild) list.removeChild(list.firstChild);
+
+    if (entries === null) {
+      list.appendChild(activityItem('', 'The automation log is unavailable here. It needs the extension engine.', 'is-empty', ''));
+      return;
+    }
+    if (!entries.length) {
+      list.appendChild(activityItem('', 'No automation activity for this tab yet.', 'is-empty', ''));
+      return;
+    }
+
+    entries.slice(-10).reverse().forEach((entry) => {
+      const item = entry && typeof entry === 'object' ? entry : {};
+      const when = formatClock(Number.isFinite(item.timestamp) ? item.timestamp : NaN);
+      const what = [
+        activityEventLabel(item.event),
+        activityKindLabel(item.kind),
+        activityStatusLabel(item.status)
+      ].filter(Boolean).join(' · ');
+      const variant = item.status === 'failed'
+        ? 'is-failed'
+        : item.status === 'skipped'
+          ? 'is-skipped'
+          : item.status === 'success'
+            ? 'is-success'
+            : '';
+      list.appendChild(activityItem(when, what, variant, typeof item.message === 'string' ? item.message : ''));
+    });
+  }
+
+  function activityShouldPoll() {
+    return env.live
+      && !!ui.automation && ui.automation.open
+      && !!ui['automation-activity'] && ui['automation-activity'].open
+      && !document.hidden;
+  }
+
+  /**
+   * The log is only polled — at most every two seconds — while its disclosure is
+   * open and the popup is visible. Closed means no timer at all.
+   */
+  function syncActivityPolling() {
+    const shouldPoll = activityShouldPoll();
+    if (!shouldPoll) {
+      if (activityTimer) {
+        clearInterval(activityTimer);
+        activityTimer = null;
+      }
+      // Opening the log without an engine explains itself instead of showing an
+      // empty box. This is a single render, never a timer.
+      if (!env.live
+        && !!ui.automation && ui.automation.open
+        && !!ui['automation-activity'] && ui['automation-activity'].open) {
+        renderActivity(null);
+      }
+      return;
+    }
+    if (activityTimer) return;
+    loadActivity();
+    activityTimer = setInterval(() => {
+      if (!activityShouldPoll()) {
+        syncActivityPolling();
+        return;
+      }
+      loadActivity();
+    }, ACTIVITY_POLL_MS);
   }
 
   // ------------------------------------------------------------------ engine
@@ -1245,6 +2523,80 @@
     ui['save-default'].addEventListener('click', saveDefaultsFromForm);
     ui['stop-all'].addEventListener('click', stopAllTabs);
 
+    // ---- Automation ----
+    // Only the two Connect/Enable buttons ever request a permission, and each
+    // one calls chrome.permissions.request synchronously inside the click.
+    const disableActiveHook = (kind) => {
+      if (!env.live || !activeTab) return;
+      sendMessage({ type: 'DISABLE_ACTION', tabId: activeTab.id, kind }).then((response) => {
+        if (response?.ok && response.state) applyState(response.state);
+      });
+    };
+    ui['automation-webhook-enabled'].addEventListener('change', () => {
+      if (!ui['automation-webhook-enabled'].checked) disableActiveHook('webhook');
+      syncAutomationPanels();
+      scheduleAutomationStatus();
+    });
+    ui['automation-script-enabled'].addEventListener('change', () => {
+      if (!ui['automation-script-enabled'].checked) disableActiveHook('script');
+      syncAutomationPanels();
+      scheduleAutomationStatus();
+    });
+    ui['automation-webhook-url'].addEventListener('input', scheduleAutomationUrlStatus);
+    ui['automation-webhook-url'].addEventListener('change', scheduleAutomationUrlStatus);
+    ui['automation-webhook-method'].addEventListener('change', scheduleAutomationUrlStatus);
+    ui['automation-webhook-details'].addEventListener('change', scheduleAutomationUrlStatus);
+    ui['automation-webhook-connect'].addEventListener('click', connectWebhook);
+    ui['automation-script-enable'].addEventListener('click', enableScriptOnSite);
+    ui['automation-script-example'].addEventListener('click', insertExampleSnippet);
+    ui['automation-script-code'].addEventListener('input', updateCodeCount);
+    ui['automation-manage-access'].addEventListener('click', openAutomationAccess);
+    ui['automation-activity-refresh'].addEventListener('click', () => loadActivity());
+
+    // The disclosure state belongs to this tab's draft, exactly like Advanced.
+    if (ui.automation) {
+      ui.automation.addEventListener('toggle', handleFormEdit);
+      ui.automation.addEventListener('toggle', () => {
+        syncAutomationPanels();
+        scheduleAutomationStatus();
+        syncActivityPolling();
+      });
+    }
+    if (ui['automation-activity']) {
+      ui['automation-activity'].addEventListener('toggle', syncActivityPolling);
+    }
+
+    if (env.hasPermissionEvents) {
+      const onPermissionChange = () => scheduleAutomationStatus();
+      try {
+        chrome.permissions.onAdded.addListener(onPermissionChange);
+        if (chrome.permissions.onRemoved && typeof chrome.permissions.onRemoved.addListener === 'function') {
+          chrome.permissions.onRemoved.addListener(onPermissionChange);
+        }
+      } catch (error) {
+        /* No permission events on this build; the indicators still refresh on demand. */
+      }
+    }
+
+    // Profile controls live outside the settings form, so their events can
+    // never write a config draft. Only these handlers read them.
+    ui['profile-select'].addEventListener('change', handleProfileSelection);
+    ui['profile-save-action'].addEventListener('click', saveCurrentAsProfile);
+    ui['profile-name'].addEventListener('input', () => {
+      clearProfileAlert();
+      if (ui['profile-name'].value.trim() !== '') ui['profile-name'].removeAttribute('aria-invalid');
+    });
+    ui['profile-name'].addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        saveCurrentAsProfile();
+      }
+    });
+    ui['profile-scope'].addEventListener('change', () => {
+      clearProfileAlert();
+      updateScopeHint();
+    });
+
     ui['link-dashboard'].addEventListener('click', (event) => {
       if (openOptions('')) event.preventDefault();
     });
@@ -1257,20 +2609,29 @@
         refreshState();
         updateCountdown();
       }
+      // Activity polling exists only while its disclosure is open and visible.
+      syncActivityPolling();
     });
 
     if (env.hasStorage && chrome.storage.onChanged && typeof chrome.storage.onChanged.addListener === 'function') {
       chrome.storage.onChanged.addListener((changes, area) => {
-        if (area !== 'local' || !changes.pickedSelector) return;
-        const picked = changes.pickedSelector.newValue;
-        if (!picked) return;
-        consumePickedSelector(picked, 'change');
+        if (area !== 'local') return;
+        if (changes.pickedSelector) {
+          const picked = changes.pickedSelector.newValue;
+          if (picked) consumePickedSelector(picked, 'change');
+        }
+        if (changes.profiles) {
+          savedProfiles = readProfileList(changes.profiles.newValue);
+          renderProfileSelect();
+          renderProfilesNote();
+        }
       });
     }
   }
 
   function handlePrimary() {
     const status = currentState.status;
+    if (env.live && hasPendingSettings()) { startSession(); return; }
     if (env.live && status === 'running') { sendAction('PAUSE', 'Paused.'); return; }
     if (env.live && status === 'paused') { sendAction('RESUME', 'Resumed.'); return; }
     startSession();
@@ -1288,15 +2649,22 @@
   // -------------------------------------------------------------------- init
 
   async function init() {
+    ui.controls.setAttribute('aria-busy', 'true');
     wireBrandMark();
+    buildEventGrids();
     wireEvents();
     syncConditionalPanels();
+    syncAutomationPanels();
 
     if (!env.live) {
       ui['preview-banner'].hidden = false;
       ui['preview-banner-text'].textContent = 'The extension engine is not reachable from this page, so nothing will refresh. This is a layout preview.';
       ui['pick-element'].disabled = true;
       ui['pick-element'].title = 'Preview only — the element picker needs the extension engine.';
+      ui['automation-webhook-connect'].disabled = true;
+      ui['automation-webhook-connect'].title = 'Preview only — the extension engine is not reachable.';
+      ui['automation-script-enable'].disabled = true;
+      ui['automation-script-enable'].title = 'Preview only — the extension engine is not reachable.';
     }
 
     const stored = await storageGet(['defaults']);
@@ -1307,23 +2675,49 @@
     activeTab = await queryActiveTab();
     pageRestricted = !!(activeTab && isRestrictedUrl(activeTab.url));
     renderTab();
+    syncScopeOptions();
+    // Automation access is per tab, so the status checks run once the active tab
+    // is known (never a permission request — only chrome.permissions.contains).
+    scheduleAutomationStatus();
 
     ui['restricted-note'].hidden = true;
     renderRestricted();
 
     if (!env.live) {
       applyState(null);
+      await refreshProfiles();
+      renderProfilesNote();
+      setProfileBusy(true);
       setStateMessage('Preview only — nothing is refreshed and nothing is sent. Install and reload the extension to use these controls.', 'is-warn');
     } else {
       // Restore this tab's unfinished draft after defaults and activeTab resolve.
       // A pending picked selector is consumed last so the fresh pick wins, and
       // refreshState polling below only ever repaints the session card.
+      let restored = false;
       if (formDirty) await persistDraft();
-      else await restoreDraft();
+      else restored = await restoreDraft();
+      await refreshProfiles();
+      // Auto-matching only happens on a first open with no draft: an unfinished
+      // draft overrides every saved profile, and a match never starts refreshing.
+      if (!restored && !formDirty && !pageRestricted) {
+        const match = matchProfileForTab();
+        if (match) {
+          // The hint is only attached when the form was really written; a late
+          // keystroke during the async work wins and is never overwritten.
+          await applyProfileToForm(match, {
+            note: `Loaded your “${match.name}” profile for ${PROFILE_SCOPE_NOUN[match.scope]} — review the settings below.`
+          });
+        }
+      }
       await consumeStoredPickedSelector();
       await refreshState();
     }
 
+    syncActivityPolling();
+    initializing = false;
+    ui.controls.setAttribute('aria-busy', 'false');
+    document.body.dataset.ready = 'true';
+    renderActions(currentState.status);
     startTicking();
   }
 

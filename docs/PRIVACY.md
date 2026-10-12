@@ -2,11 +2,15 @@
 
 Effective date: October 12, 2026.
 
-The Best Auto Refresh App runs locally in your browser. It does not collect or transmit personal information, browsing history, page contents, keywords, or monitoring results to the developer or any server. It has no analytics, advertising, accounts, or third-party tracking services.
+The Best Auto Refresh App monitors pages locally in your browser. The developer does not collect your information. It has no analytics, advertising, accounts, or third-party tracking services. Optional webhooks send event data to the endpoint you configure and enable; custom scripts can read or change the page and perform the operations you write.
 
 ## Local data
 
 The extension stores your settings and saved profiles in the browser's local extension storage. Unfinished popup settings, including any typed keywords and selectors, are saved per tab in temporary browser session storage so closing the popup does not discard your work. Active monitoring sessions also store the tab identifier, URL/title, monitoring rules, normalized page text needed for comparison, timing, and results in browser session storage. Temporary drafts and sessions are cleared when the browser session ends. Local saved settings remain until removed or the extension is uninstalled. Do not put secrets in saved keyword profiles on shared devices.
+
+Scoped profiles also store the selected website origin or page address (path and query, excluding the fragment and URL credentials) locally to suggest the appropriate settings. Countdown messages stay inside the extension and contain only session identifiers, not page text.
+
+Automation settings can include webhook addresses, custom headers, JSON body templates, and JavaScript code. These remain in local settings/profiles and temporary drafts. Local storage is not encrypted. The hook activity log is stored temporarily in browser session storage, contains generic outcomes rather than request/response bodies or code, and is capped at 100 entries.
 
 ## Permissions
 
@@ -15,11 +19,11 @@ The extension stores your settings and saved profiles in the browser's local ext
 - **storage:** Saves local preferences/profiles and temporary monitoring state.
 - **alarms:** Wakes the extension to check refresh scheduling when its background worker sleeps.
 
-The extension does not request access to all sites, your browsing history, notifications, clipboard, downloads, passwords, or contacts.
+Normal refreshing does not request access to all sites, browsing history, notifications, clipboard, downloads, passwords, or contacts. The optional automation features request access to only the website hostname you explicitly connect. Chrome's host grants cover the hostname rather than an individual endpoint path or port. Optional `userScripts` permission and Chrome's Allow User Scripts setting are required only for custom JavaScript. You can revoke optional grants from the dashboard.
 
 ## Network activity
 
-Refreshing a tab makes the website's normal network requests. Those requests are handled by that website under its own privacy policy. The extension itself has no external data transmission endpoints.
+Refreshing a tab makes the website's normal network requests, handled under that website's privacy policy. If you enable a webhook, the extension also sends requests to your configured endpoint. Default payloads contain event type, time, refresh count, and monitor status. Page address, title, keyword, selector and stop reason are excluded unless you enable Include page details. Custom body templates and headers are sent as you configure them. The extension does not automatically send page text, browser cookies, or credentials; webhook redirects are not followed and failed requests are not automatically retried. Any custom JavaScript network operations are defined by your code. The endpoint provider's privacy policy applies to data you send there.
 
 ## Control and contact
 

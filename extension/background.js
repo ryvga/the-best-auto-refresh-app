@@ -20,17 +20,24 @@
  * 5. Timing model: nextRefreshAt is when the next reload is due. After a reload
  *    the page settles and checks immediately; if the condition is still unmet
  *    the background waits until nextRefreshAt and then reloads.
+ * 6. The toolbar badge counts down to nextRefreshAt. The page owns a one-per-
+ *    second ABRA_COUNTDOWN heartbeat (identity only, no page content) so the
+ *    countdown survives the popup closing and never depends on a service-worker
+ *    timer. The background recomputes the number from its own deadline, ignores
+ *    heartbeats that arrive too fast, never writes storage or takes the tab lock
+ *    for one, and re-applies the correct badge from storage after a restart.
  *
  * Permissions used: activeTab + scripting (inject on user gesture, re-inject
  * after same-origin reloads), storage (local UI data + durable session state),
- * alarms (watchdog). No tabs/host/notification permissions and no network.
+ * alarms (watchdog). No required host, tabs or notification permissions.
+ * Optional automation uses separately granted host/userScripts access.
  */
 import {
   PICK_TTL_MS,
   alarmNameForTab,
   badgeColorFor,
-  badgeTextFor,
   bumpGeneration,
+  countdownSecondsUntil,
   createSessionRecord,
   createSessionToken,
   describeRestrictedTarget,
@@ -39,15 +46,19 @@ import {
   planCycle,
   publicSessionState,
   sameOrigin,
+  sessionBadgeText,
+  shouldAcceptCountdown,
   tabIdFromAlarmName,
   toFiniteNumber,
   validateConfig,
   validateContentMessage,
+  validateCountdownMessage,
   validatePickMessage,
   validateUiMessage,
   watchdogDelayMs,
   withDefaults
 } from './core.js';
+import { runActions, getActionCapabilities, getActionLog } from './actions.js';
 
 const SESSION_KEY = 'abraSessions';
 const PICKED_KEY = 'pickedSelector';
@@ -63,6 +74,11 @@ const sessions = new Map();
 const picks = new Map();
 /** tabId -> tail of the promise chain serializing work for that tab. */
 const locks = new Map();
+/**
+ * tabId -> { text, color, title, lastCountdownAt }: the badge values currently
+ * applied plus the countdown heartbeat rate gate. RAM only, never persisted.
+ */
+const badgeState = new Map();
 let hydratePromise = null;
 
 /* -------------------------------------------------------------------------- */
@@ -135,7 +151,10 @@ function normalizeRecord(tabId, raw) {
     lastCheckedAt: toFiniteNumber(raw.lastCheckedAt),
     lastResult: raw.lastResult && typeof raw.lastResult === 'object' ? raw.lastResult : null,
     error: typeof raw.error === 'string' ? raw.error : null,
-    baseline: raw.baseline && typeof raw.baseline === 'object' ? raw.baseline : null
+    baseline: raw.baseline && typeof raw.baseline === 'object' ? raw.baseline : null,
+    documentId: typeof raw.documentId === 'string' ? raw.documentId : null,
+    pendingRefreshCount: toFiniteNumber(raw.pendingRefreshCount),
+    completedRefreshCount: toFiniteNumber(raw.completedRefreshCount) || 0
   };
   return record;
 }
@@ -166,8 +185,9 @@ async function hydrate() {
   }
   await clearAllWatchdogs();
   for (const record of sessions.values()) {
-    if (record.status !== 'running') continue;
+    // Resumes the countdown from the stored deadline after a worker restart.
     refreshBadge(record);
+    if (record.status !== 'running') continue;
     scheduleWatchdog(record);
     // The worker may have been asleep past the due time: recover immediately
     // instead of waiting for the next alarm.
@@ -241,11 +261,32 @@ function clearWatchdog(tabId) {
 /* Badges                                                                     */
 /* -------------------------------------------------------------------------- */
 
-function buildBadgeTitle(record) {
+function badgeStateFor(tabId) {
+  let state = badgeState.get(tabId);
+  if (!state) {
+    state = { text: null, color: null, title: null, lastCountdownAt: 0 };
+    badgeState.set(tabId, state);
+  }
+  return state;
+}
+
+/**
+ * Hover title. While running it always carries the exact remaining seconds,
+ * even when the badge itself has switched to compact minutes or hours.
+ */
+function buildBadgeTitle(record, now = Date.now()) {
   const refreshes = record.refreshCount > 0 ? ` — ${record.refreshCount} refresh(es)` : '';
   switch (record.status) {
-    case 'running':
-      return `The Best Auto Refresh App — monitoring${refreshes}`;
+    case 'running': {
+      const seconds = countdownSecondsUntil(record.nextRefreshAt, now);
+      const next =
+        seconds === null
+          ? 'waiting for the next check'
+          : seconds <= 0
+            ? 'refresh due now'
+            : `next refresh in ${seconds}s`;
+      return `The Best Auto Refresh App — monitoring — ${next}${refreshes}`;
+    }
     case 'paused':
       return `The Best Auto Refresh App — paused${refreshes}`;
     case 'matched':
@@ -257,17 +298,33 @@ function buildBadgeTitle(record) {
   }
 }
 
-function refreshBadge(record) {
+/**
+ * Apply the shared badge formatter to one tab. The countdown changes every
+ * second, so only the values that actually differ are pushed to the toolbar.
+ */
+function refreshBadge(record, now = Date.now()) {
   if (!chrome.action || !record) return;
   const tabId = record.tabId;
-  const text = badgeTextFor(record.status);
+  const text = sessionBadgeText(record, now);
   const color = badgeColorFor(record.status);
-  safeCall(() => chrome.action.setBadgeText({ tabId, text }));
-  safeCall(() => chrome.action.setBadgeBackgroundColor({ tabId, color }));
-  safeCall(() => chrome.action.setTitle({ tabId, title: buildBadgeTitle(record) }));
+  const title = buildBadgeTitle(record, now);
+  const state = badgeStateFor(tabId);
+  if (state.text !== text) {
+    state.text = text;
+    safeCall(() => chrome.action.setBadgeText({ tabId, text }));
+  }
+  if (state.color !== color) {
+    state.color = color;
+    safeCall(() => chrome.action.setBadgeBackgroundColor({ tabId, color }));
+  }
+  if (state.title !== title) {
+    state.title = title;
+    safeCall(() => chrome.action.setTitle({ tabId, title }));
+  }
 }
 
 function clearBadge(tabId) {
+  badgeState.delete(tabId);
   if (!chrome.action) return;
   safeCall(() => chrome.action.setBadgeText({ tabId, text: '' }));
 }
@@ -350,7 +407,8 @@ async function attachSession(record, delayMs) {
     tabId: record.tabId,
     token: record.token,
     generation: record.generation,
-    config: record.config,
+    // Webhook credentials and user code never enter the monitoring helper.
+    config: Object.fromEntries(Object.entries(record.config).filter(([key]) => key !== 'actions')),
     baseline: record.baseline,
     status: record.status,
     delayMs: wait
@@ -374,6 +432,41 @@ async function notifyStatus(record, status) {
   });
 }
 
+async function captureDocument(record) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: record.tabId, frameIds: [0] },
+      func: () => location.href
+    });
+    const top = results.find((entry) => entry.frameId === 0);
+    if (!top || !sameOrigin(top.result, record.origin)) return false;
+    record.documentId = top.documentId || null;
+    return true;
+  } catch {
+    record.documentId = null;
+    return false;
+  }
+}
+
+async function fireActions(record, event, reason = '') {
+  try {
+    await runActions(record, event, { reason, documentId: record.documentId });
+  } catch {
+    // Optional actions never turn a healthy monitor into an engine error.
+  }
+}
+
+async function isCurrentDocument(record) {
+  if (!record.documentId) return false;
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: record.tabId, frameIds: [0] }, func: () => location.href
+    });
+    const top = results.find((entry) => entry.frameId === 0);
+    return top?.documentId === record.documentId && sameOrigin(top.result, record.origin);
+  } catch { return false; }
+}
+
 /* -------------------------------------------------------------------------- */
 /* Session lifecycle                                                          */
 /* -------------------------------------------------------------------------- */
@@ -390,10 +483,11 @@ async function finishWithMatched(record, reason) {
   refreshBadge(record);
   await notifyStatus(record, 'stopped');
   await persistSessions();
+  await fireActions(record, 'match', reason);
   return { ok: true, action: 'stop', state: publicSessionState(record), reason };
 }
 
-async function finishStopped(record, reason) {
+async function finishStopped(record, reason, event = 'limit') {
   bumpGeneration(record);
   record.status = 'stopped';
   record.error = null;
@@ -405,6 +499,7 @@ async function finishStopped(record, reason) {
   refreshBadge(record);
   await notifyStatus(record, 'stopped');
   await persistSessions();
+  await fireActions(record, event, reason);
   return { ok: true, action: 'stop', state: publicSessionState(record), reason };
 }
 
@@ -420,6 +515,7 @@ async function finishWithError(record, message) {
   refreshBadge(record);
   await notifyStatus(record, 'stopped');
   await persistSessions();
+  await fireActions(record, 'error', message);
   return { ok: true, action: 'stop', state: publicSessionState(record), error: message };
 }
 
@@ -445,6 +541,7 @@ function parkSession(record) {
     checkedAt: Date.now()
   };
   clearWatchdog(record.tabId);
+  refreshBadge(record);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -473,6 +570,9 @@ async function runCheck(record, msg) {
   if (typeof msg.title === 'string') record.title = msg.title;
   record.lastCheckedAt = now;
   record.watchdogRetries = 0;
+  // A page action may navigate. Leave navigation recovery to onUpdated and
+  // never apply a snapshot or reload decision to its replacement document.
+  if (!await isCurrentDocument(record)) return { ok: true, action: 'wait' };
 
   // core.planCycle owns every matching/timing decision; this file only applies
   // the chrome side effects (storage, badge, alarms, page messages).
@@ -480,6 +580,9 @@ async function runCheck(record, msg) {
   record.baseline = plan.baseline || null;
   record.lastResult = plan.lastResult;
   record.nextRefreshAt = plan.nextRefreshAt;
+  await fireActions(record, 'check', plan.reason);
+  if (sessions.get(record.tabId) !== record || record.status !== 'running'
+      || !await isCurrentDocument(record)) return { ok: true, action: 'wait' };
 
   if (plan.kind === 'matched') {
     return finishWithMatched(record, plan.reason);
@@ -495,6 +598,7 @@ async function runCheck(record, msg) {
     record.scheduledFor = plan.nextRefreshAt;
     await persistSessions();
     scheduleWatchdog(record);
+    refreshBadge(record, now);
     return {
       ok: true,
       action: 'schedule',
@@ -503,6 +607,9 @@ async function runCheck(record, msg) {
     };
   }
 
+  await fireActions(record, 'before-refresh', plan.reason);
+  if (sessions.get(record.tabId) !== record || record.status !== 'running'
+      || !await isCurrentDocument(record)) return { ok: true, action: 'wait' };
   record.refreshCount = plan.refreshCount;
   record.lastReloadAt = now;
   record.reloadPendingAt = now;
@@ -514,6 +621,7 @@ async function runCheck(record, msg) {
   });
   if (!prepared.ok) return finishWithError(record, 'The page could not prepare for its next refresh.');
   bumpGeneration(record);
+  record.pendingRefreshCount = record.refreshCount;
   await persistSessions();
   scheduleWatchdog(record);
   refreshBadge(record);
@@ -569,7 +677,10 @@ async function handleStart(msg) {
     record.title = handshake.title || '';
     record.origin = originOf(url);
     record.nextRefreshAt = now + nextIntervalMs(record);
+    record.pendingRefreshCount = null;
+    record.completedRefreshCount = 0;
     sessions.set(tabId, record);
+    await captureDocument(record);
 
     const attached = await attachSession(record, 0);
     if (!attached.ok) {
@@ -581,6 +692,7 @@ async function handleStart(msg) {
     refreshBadge(record);
     scheduleWatchdog(record);
     await persistSessions();
+    await fireActions(record, 'start');
     return { ok: true, state: publicSessionState(record) };
   });
 }
@@ -592,7 +704,7 @@ async function handleStop(msg) {
     const record = sessions.get(tabId);
     if (!record) return { ok: true, state: null };
     if (record.status === 'running' || record.status === 'paused') {
-      await finishStopped(record, 'Stopped by the user.');
+      await finishStopped(record, 'Stopped by the user.', 'manual-stop');
     } else {
       clearWatchdog(tabId);
       clearBadge(tabId);
@@ -622,6 +734,7 @@ async function handlePause(msg) {
     refreshBadge(record);
     await notifyStatus(record, 'paused');
     await persistSessions();
+    await fireActions(record, 'pause');
     return { ok: true, state: publicSessionState(record) };
   });
 }
@@ -666,13 +779,12 @@ async function handleResume(msg) {
     }
     if (typeof handshake.title === 'string' && handshake.title !== '') record.title = handshake.title;
 
+    await captureDocument(record);
+    await fireActions(record, 'resume');
+
     const attached = await attachSession(record, 0);
     if (!attached.ok) {
-      record.status = 'error';
-      record.error = attached.error;
-      clearWatchdog(tabId);
-      refreshBadge(record);
-      await persistSessions();
+      await finishWithError(record, attached.error);
       return { ok: false, error: attached.error };
     }
     refreshBadge(record);
@@ -741,6 +853,9 @@ async function handleReport(msg, sender) {
   const record = sessions.get(tabId) || null;
   const validation = validateContentMessage(record, sender, msg);
   if (!validation.ok) return validation;
+  if (sender.frameId !== 0 || (record.documentId && sender.documentId !== record.documentId)) {
+    return { ok: false, error: 'Message rejected: this is not the monitored document.' };
+  }
 
   const now = Date.now();
   record.watchdogRetries = 0;
@@ -756,6 +871,7 @@ async function handleReport(msg, sender) {
     record.nextRefreshAt = null;
     record.scheduledFor = now;
     scheduleWatchdog(record);
+    refreshBadge(record, now);
     await persistSessions();
     return { ok: true, action: 'schedule', delayMs: 0 };
   }
@@ -771,6 +887,32 @@ async function handleReport(msg, sender) {
   }
 
   return withTabLock(tabId, () => runCheck(record, msg));
+}
+
+/**
+ * One-per-second badge heartbeat from the monitored top frame.
+ *
+ * It carries identity only: no page text, URL or title. The background
+ * recomputes the countdown from its own nextRefreshAt, ignores heartbeats that
+ * arrive faster than the rate gate, and deliberately takes no tab lock and
+ * writes no storage, so a heartbeat can never move the schedule, deadlock a
+ * check or reset a timer.
+ */
+function handleCountdown(msg, sender) {
+  const tabId = sender.tab.id;
+  const record = sessions.get(tabId) || null;
+  const validation = validateCountdownMessage(record, sender, msg);
+  if (!validation.ok) return validation;
+  if (record.status !== 'running') return { ok: true, ignored: true };
+
+  const now = Date.now();
+  const state = badgeStateFor(tabId);
+  if (!shouldAcceptCountdown(state.lastCountdownAt, now)) {
+    return { ok: true, throttled: true };
+  }
+  state.lastCountdownAt = now;
+  refreshBadge(record, now);
+  return { ok: true };
 }
 
 async function handlePicked(msg, sender) {
@@ -845,10 +987,19 @@ async function handleTabUpdated(tabId, changeInfo) {
 
     // Same origin: re-inject if needed and settle-and-check straight away so a
     // change produced by the reload is detected immediately.
+    await captureDocument(current);
     const attached = await attachSession(current, 0);
     if (!attached.ok) {
       await finishWithError(current, attached.error);
       return;
+    }
+    if (changeInfo.status === 'complete' && current.pendingRefreshCount !== null
+        && current.pendingRefreshCount > (current.completedRefreshCount || 0)) {
+      current.completedRefreshCount = current.pendingRefreshCount;
+      current.pendingRefreshCount = null;
+      // Persist the completion marker before dispatching optional side effects.
+      await persistSessions();
+      await fireActions(current, 'after-refresh');
     }
     scheduleWatchdog(current);
     await persistSessions();
@@ -884,6 +1035,7 @@ async function handleAlarm(alarm) {
       await finishWithError(current, content.error);
       return;
     }
+    await captureDocument(current);
     const attached = await attachSession(current, 0);
     if (!attached.ok) {
       await finishWithError(current, attached.error);
@@ -901,6 +1053,7 @@ async function handleTabRemoved(tabId) {
   await withTabLock(tabId, async () => {
     sessions.delete(tabId);
     picks.delete(tabId);
+    badgeState.delete(tabId);
     clearWatchdog(tabId);
     await persistSessions();
   });
@@ -921,6 +1074,7 @@ async function pruneMissingTabs() {
       sessions.delete(tabId);
       picks.delete(tabId);
       locks.delete(tabId);
+      badgeState.delete(tabId);
       changed = true;
     }
   }
@@ -931,6 +1085,7 @@ async function handleStartup() {
   // A browser restart must not silently resume monitoring.
   sessions.clear();
   picks.clear();
+  badgeState.clear();
   await persistSessions();
   await clearAllWatchdogs();
   try {
@@ -954,6 +1109,8 @@ async function handleContentMessage(msg, sender) {
   switch (msg.type) {
     case 'ABRA_REPORT':
       return handleReport(msg, sender);
+    case 'ABRA_COUNTDOWN':
+      return handleCountdown(msg, sender);
     case 'ABRA_PICKED':
       return handlePicked(msg, sender);
     case 'ABRA_PICK_CANCELLED':
@@ -996,6 +1153,26 @@ async function handleIncoming(msg, sender) {
       return handleGetAll();
     case 'PICK_ELEMENT':
       return handlePickElement(msg);
+    case 'ACTION_CAPABILITIES': {
+      const tabId = readTabId(msg);
+      const tab = tabId === null ? null : await getTabInfo(tabId);
+      return getActionCapabilities(tab?.url || '');
+    }
+    case 'ACTION_LOG': {
+      const tabId = readTabId(msg);
+      if (tabId === null) return { ok: false, error: 'A tab id is required.' };
+      return getActionLog(tabId);
+    }
+    case 'DISABLE_ACTION': {
+      const tabId = readTabId(msg);
+      if (tabId === null || !['webhook', 'script'].includes(msg.kind)) {
+        return { ok: false, error: 'A tab and action kind are required.' };
+      }
+      const record = sessions.get(tabId);
+      if (record?.config?.actions?.[msg.kind]) record.config.actions[msg.kind].enabled = false;
+      await persistSessions();
+      return { ok: true, state: publicSessionState(record || null) };
+    }
     default:
       return { ok: false, error: `Message rejected: unsupported type "${msg.type}".` };
   }

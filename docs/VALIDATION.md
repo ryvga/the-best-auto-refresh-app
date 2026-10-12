@@ -1,4 +1,22 @@
-# Validation — version 1.0.0
+# Validation
+
+## Version 1.2.0 — event automation
+
+Validated in the installed Helium 141 executable using fresh disposable profiles. The production manifest retains the four required permissions and declares userScripts and specific-host access as optional. Custom scripts use the documented Chrome 135+ one-shot API; stable Google Chrome remains a separate pre-submission check.
+
+- 57 engine/automation tests passed: configuration and endpoint validation, revoked/missing permissions, precise document targeting, asynchronous script results, private errors, single-pass JSON templates and log restoration after module restart.
+- 14 real MV3 automation checks passed: selected lifecycle events, after-refresh deduplication, default payload privacy and omitted cookies, custom templates with literal quotes/tokens, optional page details/headers, pause/resume/manual-stop, HTTP failures, redirects, missing host grants, resume attach errors, immediate hook disable, real isolated asynchronous JavaScript, five-second timeout with an independent script, profile/dashboard round trips, raw unfinished drafts, and 360/400px layout.
+- Existing suites passed: 24 refresh flow checks, 15 quick-profile/countdown checks, and 11 per-tab popup draft checks. Syntax, manifest/assets, and diff checks pass.
+
+The JavaScript test enabled Allow User Scripts only in a disposable test profile and verified real userScripts.execute execution; it did not change the user's browser setting. All test webhooks used a controlled loopback receiver. No third-party webhook, Store submission, or publication occurred.
+
+Workers: bailian-tpp DeepSeek V4.1 Flash supplied the automation UI and runner/schema; the orchestrator stopped extended worker runs after code delivery, integrated lifecycle hooks, repaired validation/template/script-result/log issues, and performed final testing. A GLM-5.3 attempt was stopped after extended analysis without code delivery. Native Luna follow-ups could not run because of the account usage limit. A bailian-tpp Qwen3.8 Flash read-only reviewer completed successfully; its resume error-hook and shared-host permission-label findings were fixed. Its Chrome 135–137 incompatibility claim was rejected against the official API documentation (worldId supports Chrome 133+, execute and document targeting support Chrome 135+); real async script completion was verified in Helium 141.
+
+Personal Helium reload is pending because Windows Computer Use could not verify the browser URL. The unpacked extension folder is ready; click Reload on its extension card to use this version. Custom JavaScript additionally requires the user's Allow User Scripts toggle.
+
+## Version 1.1.0 — countdown and scoped quick profiles
+
+Added toolbar seconds countdown, exact page/site profile matching, manual global profiles, per-tab draft priority, and explicit Apply & restart when settings differ from an active monitor. DeepSeek V4.1 Flash supplied UI and countdown changes; native Luna supplied the 15-check profile regression suite and read-only countdown review. The orchestrator integrated and verified them. These features are included in 1.2.0.
 
 ## Version 1.0.1 — popup drafts
 

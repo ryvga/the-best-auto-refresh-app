@@ -32,7 +32,22 @@
  * Timestamps (startedAt, lastCheckedAt, nextRefreshAt) are epoch milliseconds
  * (numbers) so the UI can do `new Date(value)`; null when not applicable.
  * `lastResult` is `{ met: boolean, reason: string, checkedAt: number }`.
+ *
+ * ---------------------------------------------------------------------------
+ * TOOLBAR BADGE (owned by background.js, pure formatters live here)
+ * ---------------------------------------------------------------------------
+ * A running session shows ceil((nextRefreshAt - now) / 1000) seconds, as plain
+ * digits up to 999, then compact minutes/hours. While the deadline is unknown
+ * (loading, settling, checking, parked) it shows an ellipsis instead of a
+ * misleading 0. Paused shows the pause bars, matched DONE, error ERR and
+ * stopped an empty badge. The hover title always carries the exact seconds.
+ *
+ * The page keeps the badge moving with a lightweight ABRA_COUNTDOWN heartbeat
+ * (one per second, no page content, no storage writes) so the countdown works
+ * with the popup closed and does not depend on a service-worker timer.
  */
+
+import { DEFAULT_ACTIONS, normalizeActions, validateActions } from './actions-core.js';
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
@@ -85,7 +100,8 @@ export const DEFAULT_CONFIG = Object.freeze({
   preserveScroll: true,
   bypassCache: false,
   pauseWhenHidden: false,
-  ignoreSelector: ''
+  ignoreSelector: '',
+  actions: DEFAULT_ACTIONS
 });
 
 export const UI_MESSAGE_TYPES = Object.freeze([
@@ -95,22 +111,40 @@ export const UI_MESSAGE_TYPES = Object.freeze([
   'RESUME',
   'GET_STATE',
   'GET_ALL',
-  'PICK_ELEMENT'
+  'PICK_ELEMENT',
+  'ACTION_CAPABILITIES',
+  'ACTION_LOG',
+  'DISABLE_ACTION'
 ]);
 
 /** Content-script -> background message types (engine internal). */
 export const CONTENT_MESSAGE_TYPES = Object.freeze([
   'ABRA_REPORT',
   'ABRA_PICKED',
-  'ABRA_PICK_CANCELLED'
+  'ABRA_PICK_CANCELLED',
+  'ABRA_COUNTDOWN'
 ]);
 
+/**
+ * Badge text while a running session has no concrete deadline yet (the page is
+ * loading, settling or being checked). Never render a misleading "0" there.
+ */
+export const BADGE_PENDING_TEXT = '…';
+/** Plain seconds are shown up to this value; longer waits use compact units. */
+export const BADGE_MAX_COUNTDOWN_SECONDS = 999;
+/**
+ * Countdown heartbeats are cheap but not free: the background ignores any that
+ * arrive closer together than this. A well-behaved page sends one per second;
+ * a page with duplicate timers is capped at a few updates per second.
+ */
+export const COUNTDOWN_MIN_GAP_MS = 250;
+
 export const BADGE_TEXT = Object.freeze({
-  running: 'ON',
+  running: BADGE_PENDING_TEXT,
   paused: 'II',
   matched: 'DONE',
   stopped: '',
-  error: '!'
+  error: 'ERR'
 });
 
 export const BADGE_COLOR = Object.freeze({
@@ -405,6 +439,10 @@ export function validateConfig(raw) {
     errors.push({ field: 'ignoreSelector', message: 'The ignored selector looks incomplete.' });
   }
 
+  const actionValidation = validateActions(input.actions);
+  config.actions = actionValidation.actions;
+  errors.push(...actionValidation.errors);
+
   if (errors.length > 0) {
     return {
       ok: false,
@@ -418,7 +456,8 @@ export function validateConfig(raw) {
 
 /** Default config merged with any partial overrides (no validation). */
 export function withDefaults(partial) {
-  return { ...DEFAULT_CONFIG, ...(partial && typeof partial === 'object' ? partial : {}) };
+  const source = partial && typeof partial === 'object' ? partial : {};
+  return { ...DEFAULT_CONFIG, ...source, actions: normalizeActions(source.actions) };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -837,6 +876,48 @@ export function badgeColorFor(status) {
   return Object.prototype.hasOwnProperty.call(BADGE_COLOR, status) ? BADGE_COLOR[status] : BADGE_COLOR.stopped;
 }
 
+/**
+ * Remaining whole seconds until `nextRefreshAt`, rounded up so the toolbar
+ * never shows a smaller number than the real wait. Null when no deadline is
+ * known (the session is loading, settling, checking or parked).
+ */
+export function countdownSecondsUntil(nextRefreshAt, now = Date.now()) {
+  const due = toFiniteNumber(nextRefreshAt);
+  if (due === null) return null;
+  const nowMs = toFiniteNumber(now);
+  if (nowMs === null) return null;
+  return Math.ceil((due - nowMs) / 1000);
+}
+
+/**
+ * Compact badge text for a whole number of seconds. A badge fits roughly four
+ * characters, so waits of 1000s and beyond switch to minutes and hours.
+ */
+export function compactCountdownText(totalSeconds) {
+  const raw = toFiniteNumber(totalSeconds);
+  const seconds = Math.floor(Math.max(0, raw === null ? 0 : raw));
+  if (seconds <= BADGE_MAX_COUNTDOWN_SECONDS) return String(seconds);
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds / 3600)}h`;
+}
+
+/**
+ * Toolbar text for a running session: exact seconds, a compact minute/hour
+ * value for long waits, or the pending ellipsis when no deadline is known.
+ */
+export function badgeCountdownText(nextRefreshAt, now = Date.now()) {
+  const seconds = countdownSecondsUntil(nextRefreshAt, now);
+  if (seconds === null) return BADGE_PENDING_TEXT;
+  return compactCountdownText(seconds);
+}
+
+/** Toolbar text for a whole session record (non-running statuses come from BADGE_TEXT). */
+export function sessionBadgeText(record, now = Date.now()) {
+  if (!record || typeof record !== 'object') return '';
+  if (record.status === 'running') return badgeCountdownText(record.nextRefreshAt, now);
+  return badgeTextFor(record.status);
+}
+
 /** True while a session should be receiving ticks and holding an alarm. */
 export function isSessionActive(record) {
   return Boolean(record) && record.status === 'running';
@@ -949,6 +1030,57 @@ export function shouldAcceptTick(record, now = Date.now(), toleranceMs = 1000) {
     return { ok: false, error: 'Message rejected: the check arrived before it was scheduled.' };
   }
   return { ok: true };
+}
+
+/**
+ * Validate a per-second countdown heartbeat from the monitored page.
+ *
+ * This is deliberately narrower than `validateContentMessage`: the sender must
+ * be the top frame (frame 0) of the session tab, and the token, generation and
+ * page origin must all still agree. The message carries no page content, only
+ * refreshes the toolbar badge, and never moves the schedule.
+ */
+export function validateCountdownMessage(record, sender, msg) {
+  if (!sender || !sender.tab || !Number.isInteger(sender.tab.id)) {
+    return { ok: false, error: 'Message rejected: sender is not a monitored tab.' };
+  }
+  if (sender.frameId !== 0) {
+    return { ok: false, error: 'Message rejected: the countdown must come from the top frame.' };
+  }
+  if (!msg || typeof msg !== 'object' || msg.type !== 'ABRA_COUNTDOWN') {
+    return { ok: false, error: 'Message rejected: malformed countdown payload.' };
+  }
+  if (!record) {
+    return { ok: false, error: 'Message rejected: no active session for this tab.' };
+  }
+  if (sender.tab.id !== record.tabId || Number(msg.tabId) !== record.tabId) {
+    return { ok: false, error: 'Message rejected: sender does not match the session tab.' };
+  }
+  if (typeof msg.token !== 'string' || msg.token === '' || msg.token !== record.token) {
+    return { ok: false, error: 'Message rejected: session token mismatch.' };
+  }
+  if (toFiniteNumber(msg.generation) !== (toFiniteNumber(record.generation) ?? 0)) {
+    return { ok: false, error: 'Message rejected: stale session generation.' };
+  }
+  const senderOrigin =
+    typeof sender.origin === 'string' && sender.origin !== '' ? sender.origin : originOf(sender.url);
+  if (record.origin && senderOrigin !== record.origin) {
+    return { ok: false, error: 'Message rejected: the page origin changed.' };
+  }
+  if (record.status !== 'running' && record.status !== 'paused') {
+    return { ok: false, error: 'Message rejected: the session is no longer running.' };
+  }
+  return { ok: true };
+}
+
+/** Rate gate for countdown heartbeats: true when one may be handled now. */
+export function shouldAcceptCountdown(lastAcceptedAt, now = Date.now(), minGapMs = COUNTDOWN_MIN_GAP_MS) {
+  const last = toFiniteNumber(lastAcceptedAt);
+  if (last === null) return true;
+  const nowMs = toFiniteNumber(now);
+  if (nowMs === null) return false;
+  const gap = toFiniteNumber(minGapMs);
+  return nowMs - last >= (gap === null ? COUNTDOWN_MIN_GAP_MS : gap);
 }
 
 /* -------------------------------------------------------------------------- */

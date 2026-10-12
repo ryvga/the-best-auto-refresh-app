@@ -7,6 +7,8 @@ assert.equal(manifest.name, 'The Best Auto Refresh App');
 assert.ok(manifest.description.length <= 132);
 assert.deepEqual([...manifest.permissions].sort(), ['activeTab', 'alarms', 'scripting', 'storage']);
 assert.equal(manifest.host_permissions?.length || 0, 0);
+assert.deepEqual(manifest.optional_permissions, ['userScripts']);
+assert.deepEqual(manifest.optional_host_permissions, ['https://*/*', 'http://localhost/*', 'http://127.0.0.1/*']);
 assert.equal(manifest.background.type, 'module');
 assert.ok(!manifest.content_security_policy?.extension_pages?.includes('https:'));
 const paths = [manifest.background.service_worker, manifest.action.default_popup, manifest.options_page || manifest.options_ui?.page, ...Object.values(manifest.icons), ...Object.values(manifest.action.default_icon || {})];
