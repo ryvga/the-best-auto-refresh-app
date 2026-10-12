@@ -144,7 +144,9 @@ export const UI_MESSAGE_TYPES = Object.freeze([
   'ACTION_CAPABILITIES',
   'ACTION_LOG',
   'DISABLE_ACTION',
-  'TEST_WEBHOOK'
+  'TEST_WEBHOOK',
+  'SAVE_PROFILE',
+  'DELETE_PROFILE'
 ]);
 
 /** Content-script -> background message types (engine internal). */

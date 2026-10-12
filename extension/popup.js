@@ -24,6 +24,7 @@ import {
 } from './actions-core.js';
 
 import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
+import { MAX_PROFILE_NAME, MAX_PROFILES } from './profiles-store.js';
 
 'use strict';
 
@@ -164,7 +165,10 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
   // when the browser closes. Values are kept exactly as typed: raw strings,
   // radio choices, checkbox states, the Advanced disclosure state, and the raw
   // automation fields (invalid JSON included) with their event selections.
-  const DRAFT_VERSION = 3;
+  // v4 added the profile-save fields: a half-written profile name, its scope and
+  // whether the save section was open are unfinished work like any other, and
+  // used to vanish when the popup closed.
+  const DRAFT_VERSION = 4;
   const DRAFT_KEY_PREFIX = 'popupDraft:';
   const DRAFT_TEXT_FIELDS = [
     'interval-seconds', 'min-seconds', 'max-seconds', 'settle-seconds',
@@ -196,8 +200,7 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     site: 'this website',
     global: 'everywhere'
   };
-  const MAX_PROFILES = 200;
-  const MAX_PROFILE_NAME = 60;
+  // Shared with the service worker, which is where the limits are enforced.
 
   // ------------------------------------------------------------ environment
 
@@ -392,6 +395,10 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
       minSeconds,
       maxSeconds,
       stopCondition,
+      // The custom condition is raw user code. Dropping it here would send a
+      // script-predicate monitor to the engine with no script, which the engine
+      // correctly refuses, and would repopulate the code box with "undefined".
+      predicateScript: typeof source.predicateScript === 'string' ? source.predicateScript : '',
       keyword: typeof source.keyword === 'string' ? source.keyword : '',
       selector: typeof source.selector === 'string' ? source.selector : '',
       caseSensitive: source.caseSensitive === true,
@@ -533,10 +540,6 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
 
   function findProfileByOptionValue(value) {
     return savedProfiles.find((profile) => optionValue(profile) === value) || null;
-  }
-
-  function newProfileId() {
-    return `p_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
   }
 
   // ------------------------------------------------------------- profile UI
@@ -781,53 +784,60 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     clearProfileAlert();
     updateScopeHint();
 
-    if (!env.hasStorage) {
+    // Saving now goes through the background worker, so a preview context
+    // (no storage or no runtime) can only describe what would be saved.
+    if (!env.hasStorage || !env.live) {
       previewMessage();
       return;
     }
 
     setProfileBusy(true);
     try {
-      const stored = await storageGet(['profiles']);
-      const profiles = readProfileList(stored.profiles);
-      const nameKey = nameRaw.toLowerCase();
       // Same name + scope + target updates in place; a different scope or
-      // target is a genuinely new profile and is saved alongside.
-      const duplicate = profiles.find(
+      // target is a genuinely new profile and is saved alongside. This lookup
+      // only fills in the request: the service worker re-checks it against
+      // freshly read storage, because the dashboard may have saved since.
+      const nameKey = nameRaw.toLowerCase();
+      const existing = savedProfiles.find(
         (profile) => profile.name.toLowerCase() === nameKey && profile.scope === scope && profile.target === target
-      );
-      if (!duplicate && profiles.length >= MAX_PROFILES) {
+      ) || null;
+      if (!existing && savedProfiles.length >= MAX_PROFILES) {
         showProfileAlert('You have 200 profiles. Remove an unused profile from the dashboard before adding another.');
         return;
       }
-      const entry = {
-        id: duplicate ? duplicate.id : newProfileId(),
-        name: nameRaw.slice(0, MAX_PROFILE_NAME),
-        config,
-        updatedAt: Date.now(),
-        scope,
-        target
-      };
-      const next = duplicate
-        ? profiles.map((profile) => (profile.id === duplicate.id ? entry : profile))
-        : profiles.concat(entry);
 
-      const saved = await storageSet({ profiles: next });
-      if (!saved) {
-        showProfileAlert('That profile could not be saved.');
+      // One queued mutation in the service worker replaces the read-modify-write
+      // this used to do, which could discard a save made from the dashboard at
+      // the same moment. createOnly refuses to adopt a profile that appeared
+      // while this one was being typed; expectedUpdatedAt refuses to overwrite a
+      // profile that changed since it was loaded.
+      const message = {
+        type: 'SAVE_PROFILE',
+        createOnly: !existing,
+        profile: { name: nameRaw, scope, target, config }
+      };
+      if (existing && Number.isFinite(existing.updatedAt)) message.expectedUpdatedAt = existing.updatedAt;
+
+      const response = await sendMessage(message);
+      if (!response || response.ok !== true) {
+        const reason = response && typeof response.error === 'string' && response.error
+          ? response.error
+          : 'That profile could not be saved.';
+        showProfileAlert(reason);
         return;
       }
 
-      savedProfiles = next;
+      const entry = response.profile;
+      savedProfiles = readProfileList(response.profiles);
       renderProfileSelect();
       renderProfilesNote();
       const select = ui['profile-select'];
       const value = optionValue(entry);
       if (select && findProfileByOptionValue(value)) select.value = value;
       if (ui['profile-name']) ui['profile-name'].value = '';
-      setFooterNote(duplicate
-        ? `Updated the profile “${entry.name}” (${PROFILE_SCOPE_NOUN[scope]}).`
-        : `Saved the profile “${entry.name}” (${PROFILE_SCOPE_NOUN[scope]}).`);
+      setFooterNote(response.created
+        ? `Saved the profile “${entry.name}” (${PROFILE_SCOPE_NOUN[scope]}).`
+        : `Updated the profile “${entry.name}” (${PROFILE_SCOPE_NOUN[scope]}).`);
     } finally {
       setProfileBusy(false);
     }
@@ -1028,7 +1038,12 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
       // Raw automation, never normalised: a half-typed header object or an
       // incomplete URL has to come back exactly as it was left.
       actions: readActionsRawFromForm(),
-      automationOpen: !!(ui.automation && ui.automation.open)
+      automationOpen: !!(ui.automation && ui.automation.open),
+      // The save-profile disclosure is unfinished work too. These stay out of
+      // `values` so the settings form's own draft keeps its exact shape.
+      profileName: ui['profile-name'] ? ui['profile-name'].value : '',
+      profileScope: ui['profile-scope'] ? ui['profile-scope'].value : null,
+      profileSaveOpen: !!(ui['profile-save'] && ui['profile-save'].open)
     };
   }
 
@@ -1061,6 +1076,17 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     // holding whatever the defaults or the matched profile put there.
     if (draft.actions && typeof draft.actions === 'object') applyActionsRawToForm(draft.actions);
     if (ui.automation) ui.automation.open = draft.automationOpen === true;
+
+    // Unfinished profile-save work comes back too: the name, the chosen scope,
+    // and whether the section was open when the popup closed.
+    if (typeof draft.profileName === 'string' && ui['profile-name']) {
+      ui['profile-name'].value = draft.profileName;
+    }
+    if (typeof draft.profileScope === 'string' && PROFILE_SCOPE_SET.has(draft.profileScope) && ui['profile-scope']) {
+      ui['profile-scope'].value = draft.profileScope;
+    }
+    if (ui['profile-save']) ui['profile-save'].open = draft.profileSaveOpen === true;
+    updateScopeHint();
 
     syncConditionalPanels();
     syncAutomationPanels();
@@ -1609,7 +1635,7 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     ui['stop-condition'].value = config.stopCondition;
     ui.keyword.value = config.keyword;
     ui.selector.value = config.selector;
-    ui['predicate-script'].value = config.predicateScript;
+    ui['predicate-script'].value = typeof config.predicateScript === 'string' ? config.predicateScript : '';
     ui['case-sensitive'].checked = config.caseSensitive;
     ui['whole-word'].checked = config.wholeWord;
     el('settle-seconds').value = String(config.settleSeconds);
@@ -2882,6 +2908,9 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     ui['profile-name'].addEventListener('input', () => {
       clearProfileAlert();
       if (ui['profile-name'].value.trim() !== '') ui['profile-name'].removeAttribute('aria-invalid');
+      // An unfinished name is work in progress, so it is drafted like any other
+      // edit. This does not touch the settings form's own dirty state.
+      persistDraft();
     });
     ui['profile-name'].addEventListener('keydown', (event) => {
       if (event.key === 'Enter') {
@@ -2892,7 +2921,11 @@ import { NTFY_DEFAULT_SERVER, describeNtfySetup } from './ntfy.js';
     ui['profile-scope'].addEventListener('change', () => {
       clearProfileAlert();
       updateScopeHint();
+      persistDraft();
     });
+    if (ui['profile-save']) {
+      ui['profile-save'].addEventListener('toggle', () => persistDraft());
+    }
 
     ui['link-dashboard'].addEventListener('click', (event) => {
       if (openOptions('')) event.preventDefault();

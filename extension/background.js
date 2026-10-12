@@ -60,6 +60,7 @@ import {
   withDefaults
 } from './core.js';
 import { runActions, getActionCapabilities, getActionLog, testWebhook, evaluatePredicate } from './actions.js';
+import { createProfilesStore } from './profiles-store.js';
 
 const SESSION_KEY = 'abraSessions';
 const PICKED_KEY = 'pickedSelector';
@@ -81,6 +82,23 @@ const locks = new Map();
  */
 const badgeState = new Map();
 let hydratePromise = null;
+
+/**
+ * Saved profiles are shared by the popup and the dashboard, which are separate
+ * documents. Routing both through one store keeps their saves from overwriting
+ * each other; see profiles-store.js.
+ */
+const profilesStore = createProfilesStore({
+  storage: {
+    async getProfiles() {
+      const stored = await chrome.storage.local.get('profiles');
+      return stored.profiles;
+    },
+    async setProfiles(profiles) {
+      await chrome.storage.local.set({ profiles });
+    }
+  }
+});
 
 /* -------------------------------------------------------------------------- */
 /* Small utilities                                                            */
@@ -1252,6 +1270,10 @@ async function handleIncoming(msg, sender) {
       return handlePickElement(msg);
     case 'TEST_WEBHOOK':
       return handleTestWebhook(msg);
+    case 'SAVE_PROFILE':
+      return profilesStore.save(msg);
+    case 'DELETE_PROFILE':
+      return profilesStore.remove(msg);
     case 'ACTION_CAPABILITIES': {
       const tabId = readTabId(msg);
       const tab = tabId === null ? null : await getTabInfo(tabId);

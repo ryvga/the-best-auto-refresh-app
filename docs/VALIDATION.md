@@ -1,5 +1,72 @@
 # Validation
 
+## Version 1.3.3 — the custom condition actually reaches the engine, and profiles stop losing changes
+
+This release fixes a defect that made 1.3.2's headline feature unusable, and closes
+a long-standing data-loss race between the popup and the dashboard.
+
+**The custom stop condition never started a monitor.** Both UI files keep their own
+`normalizeConfig`, and each one built an explicit object listing every field it
+carried. `predicateScript` was not in either list, so the code the user typed was
+dropped between the form and the `START` message. `core.validateConfig` then refused
+the config for missing required code, and the popup reported an engine error. The
+feature was correct in `core.js`, `actions.js` and `background.js` and unreachable
+from the interface. `applyConfigToForm` had the matching fault: it assigned
+`config.predicateScript` unconditionally, so repopulating the form painted the
+literal word `undefined` into the code box.
+
+- Both normalisers now carry the field, guarded to a string.
+- Both restore sites are guarded too, so no config can write `undefined` into the box.
+- `tests/predicate.test.mjs` previously asserted that the token `predicateScript`
+  appeared *somewhere* in each UI file, which is exactly how this shipped. It now
+  extracts the `normalizeConfig` body itself, requires the guarded assignment inside
+  that function, and pins the dashboard's restore site. A companion assertion proves
+  the engine agrees with the normaliser: the carried shape validates, and the same
+  shape with the field deleted is refused.
+
+**Saved profiles are now written by one owner.** Reading the whole `profiles` array,
+editing it in the page, and writing it back meant a popup save and a dashboard save
+racing each other silently discarded one of the two. `extension/profiles-store.js`
+moves every mutation into the service worker behind `SAVE_PROFILE` and
+`DELETE_PROFILE`. Operations are serialised through a promise chain, so a rejected
+operation cannot break the queue; each one re-reads storage inside the critical
+section; `expectedUpdatedAt` is an optimistic version check that refuses a stale
+update or delete instead of overwriting newer work; and `createOnly` means a "new
+profile" save cannot clobber an entry that appeared while the user was typing.
+`updatedAt` is `max(now, current + 1)` so two saves in the same millisecond still
+order correctly. Both pages now send messages instead of writing the array, and
+`tests/profiles-store.test.mjs` asserts that neither file writes `profiles` again —
+the guard matters more than the port, because the port is easy to undo by accident.
+
+**Unfinished profile work survives the popup closing.** The name, scope and open/closed
+state of the save section are part of the tab draft now (`DRAFT_VERSION` 4), alongside
+the half-typed settings that were already preserved. Old version-3 drafts still restore:
+`applyDraftToForm` reads fields individually and never version-gates the whole record.
+
+- 110 unit tests pass, up from 96 at 1.3.2. New: 11 in `tests/profiles-store.test.mjs`
+  (serialisation under concurrent saves and deletes, scope coexistence, stale
+  update/delete rejection, malformed id/target/scope/config rejection, storage-failure
+  safety, `createOnly` collision, the profile ceiling, and a custom-condition round trip),
+  and one more in `tests/predicate.test.mjs` for the normaliser parity above.
+- The runtime message contract in `tests/engine.test.mjs` gained `SAVE_PROFILE` and
+  `DELETE_PROFILE`, so `validateUiMessage` still rejects anything outside the documented
+  set — page content cannot reach the profile library.
+- The dashboard note that claimed "Pressing Start in the popup also saves them as your
+  defaults" was false: Start applies a config to one tab. It now says so.
+- Syntax, manifest and least-privilege validation pass, and the package still contains
+  only extension files. `manifest.json` and `package.json` are at 1.3.3.
+- `extension/manifest.json` keeps `minimum_chrome_version` at 106 and the version at
+  1.3.3; the divergent local 1.4.0 line was read as a source of fixes only, and its
+  version and Chrome floor were deliberately not adopted.
+
+Not verified in a real browser: the browser-driven save-race scenarios on the other
+line depend on copy and markup this release does not adopt, so they were not ported and
+no automated run covers the two pages racing each other end to end. The store's
+behaviour under concurrency is covered by unit tests against a fake storage adapter
+that injects read and write delays; the real `chrome.storage.local` round trip is not.
+A manual pass on the custom condition (type a predicate, start, reopen the popup, see
+the code rather than `undefined`) is the one check worth repeating by hand.
+
 ## Version 1.3.2 — custom JavaScript stop condition
 
 Adds a new stop condition, `script-predicate`, for logic the built-in comparisons

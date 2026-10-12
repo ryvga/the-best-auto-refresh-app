@@ -402,6 +402,14 @@ test('the predicate path never evals user code in an extension context', () => {
   assert.equal(/innerHTML/.test(actions), false);
 });
 
+/** Source of one top-level function inside a UI IIFE, up to the next sibling. */
+function functionBody(source, signature) {
+  const start = source.indexOf(signature);
+  assert.notEqual(start, -1, `missing ${signature}`);
+  const next = source.indexOf('\n  function ', start + signature.length);
+  return source.slice(start, next === -1 ? source.length : next);
+}
+
 test('the popup and the dashboard both offer the custom condition end to end', () => {
   for (const name of ['popup', 'options']) {
     const html = read(`${name}.html`);
@@ -417,9 +425,39 @@ test('the popup and the dashboard both offer the custom condition end to end', (
 
     assert.match(js, /'script-predicate'/, `${name}.js must know the condition`);
     assert.match(js, /SCRIPT_CONDITIONS/, `${name}.js must gate the panel`);
-    assert.match(js, /predicateScript/, `${name}.js must carry the code into the config`);
     assert.match(js, /'predicate-panel', 'predicate-script', 'predicate-access'/, `${name}.js must look the nodes up`);
     assert.match(js, /'predicate-script',/, `${name}.js must validate the field`);
-    assert.match(js, /ui\['predicate-script'\]\.value = config\.predicateScript;/, `${name}.js must restore the saved code`);
+
+    // Restoring must never hand the textarea a non-string: an ungated copy of an
+    // absent value paints the literal word "undefined" into the code box.
+    assert.match(
+      js,
+      /ui\['predicate-script'\]\.value = typeof config\.predicateScript === 'string' \? config\.predicateScript : '';/,
+      `${name}.js must restore the saved code defensively`
+    );
+  }
+});
+
+test('both UI copies of normalizeConfig carry the custom condition through', () => {
+  // 1.3.2 shipped with normalizeConfig building an explicit object that omitted
+  // predicateScript. The engine then refused every script-predicate start, so
+  // the feature was unreachable from the UI even though core.js, actions.js and
+  // background.js all supported it. Asserting that the token appears *somewhere*
+  // in the file is what let that through, so this checks the assignment itself,
+  // inside the function that has to make it.
+  for (const name of ['popup', 'options']) {
+    const body = functionBody(read(`${name}.js`), 'function normalizeConfig(raw) {');
+    assert.match(
+      body,
+      /predicateScript: typeof source\.predicateScript === 'string' \? source\.predicateScript : ''/,
+      `${name}.js normalizeConfig must keep predicateScript`
+    );
+    // A dropped field is invisible at the call site, so also prove the normaliser
+    // and the engine agree: the shape it returns has to satisfy validateConfig.
+    const carried = { ...DEFAULT_CONFIG, stopCondition: 'script-predicate', predicateScript: 'return false;' };
+    assert.equal(validateConfig(carried).ok, true);
+    const dropped = { ...carried };
+    delete dropped.predicateScript;
+    assert.equal(validateConfig(dropped).ok, false, 'the engine must refuse a script-predicate config with no code');
   }
 });

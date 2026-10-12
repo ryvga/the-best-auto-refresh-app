@@ -840,7 +840,7 @@ const extensionDir = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'ext
 const manifest = JSON.parse(readFileSync(resolve(extensionDir, 'manifest.json'), 'utf8'));
 
 test('the runtime message contract is exactly the documented set', () => {
-  assert.deepEqual([...UI_MESSAGE_TYPES], ['START', 'STOP', 'PAUSE', 'RESUME', 'GET_STATE', 'GET_ALL', 'PICK_ELEMENT', 'ACTION_CAPABILITIES', 'ACTION_LOG', 'DISABLE_ACTION', 'TEST_WEBHOOK']);
+  assert.deepEqual([...UI_MESSAGE_TYPES], ['START', 'STOP', 'PAUSE', 'RESUME', 'GET_STATE', 'GET_ALL', 'PICK_ELEMENT', 'ACTION_CAPABILITIES', 'ACTION_LOG', 'DISABLE_ACTION', 'TEST_WEBHOOK', 'SAVE_PROFILE', 'DELETE_PROFILE']);
   assert.deepEqual([...STOP_CONDITIONS], [
     'never',
     'page-change',

@@ -13,6 +13,7 @@
  */
 
 import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
+import { MAX_PROFILE_NAME } from './profiles-store.js';
 
 'use strict';
 
@@ -118,7 +119,6 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     site: 'this website',
     global: 'everywhere'
   };
-  const MAX_PROFILE_NAME = 60;
 
   // ------------------------------------------------------------ environment
 
@@ -230,6 +230,9 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
       minSeconds,
       maxSeconds: Math.max(minSeconds, clampInt(source.maxSeconds, MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS, DEFAULT_CONFIG.maxSeconds)),
       stopCondition: STOP_CONDITION_SET.has(source.stopCondition) ? source.stopCondition : DEFAULT_CONFIG.stopCondition,
+      // Raw user code, kept verbatim. Dropping it would make a script-predicate
+      // default or profile invalid the moment it is saved.
+      predicateScript: typeof source.predicateScript === 'string' ? source.predicateScript : '',
       keyword: typeof source.keyword === 'string' ? source.keyword : '',
       selector: typeof source.selector === 'string' ? source.selector : '',
       caseSensitive: source.caseSensitive === true,
@@ -646,7 +649,7 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
     ui['stop-condition'].value = config.stopCondition;
     ui.keyword.value = config.keyword;
     ui.selector.value = config.selector;
-    ui['predicate-script'].value = config.predicateScript;
+    ui['predicate-script'].value = typeof config.predicateScript === 'string' ? config.predicateScript : '';
     ui['case-sensitive'].checked = config.caseSensitive;
     ui['whole-word'].checked = config.wholeWord;
     el('settle-seconds').value = String(config.settleSeconds);
@@ -970,13 +973,13 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
 
   // --------------------------------------------------------------- profiles
 
-  async function persistProfiles(profiles) {
-    const saved = await storageSet({ profiles });
-    return saved;
-  }
-
+  /**
+   * Mutations run in the service worker. This page used to read the whole array
+   * and write it back, so a save made in the popup at the same moment could be
+   * discarded; see profiles-store.js.
+   */
   async function saveProfile() {
-    const name = ui['profile-name'].value.trim().slice(0, MAX_PROFILE_NAME);
+    const name = ui['profile-name'].value.trim();
     const { config, errors } = collectForm();
     if (errors.length) { showErrors(errors); return; }
     if (!name) {
@@ -986,43 +989,42 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
       return;
     }
     setAlert(ui['profiles-alert'], '');
-    if (!env.hasStorage) {
+    if (!env.hasStorage || !env.live) {
       setProfilesNote(PREVIEW_NOTE);
       return;
     }
-    const stored = await storageGet(['profiles']);
-    const profiles = readProfiles(stored.profiles);
-    const nameKey = name.toLowerCase();
     // This page saves an unscoped profile. Only a global profile with the same
     // name is treated as the same entry: a scoped profile that happens to share
-    // the name keeps its own settings, scope, and target untouched.
-    const duplicate = profiles.find(
+    // the name keeps its own settings, scope, and target untouched. The
+    // service worker re-checks this against freshly read storage.
+    const nameKey = name.toLowerCase();
+    const stored = await storageGet(['profiles']);
+    const duplicate = readProfiles(stored.profiles).find(
       (profile) => profile.scope === 'global' && profile.name.toLowerCase() === nameKey
     );
-    const entry = {
-      id: duplicate ? duplicate.id : `p_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-      name,
-      config,
-      updatedAt: Date.now(),
-      scope: 'global',
-      target: ''
-    };
-    const next = duplicate
-      ? profiles.map((profile) => (profile.id === duplicate.id ? entry : profile))
-      : profiles.concat(entry);
 
-    const saved = await persistProfiles(next);
-    if (!saved) {
-      setProfilesNote('That profile could not be saved.');
+    const message = {
+      type: 'SAVE_PROFILE',
+      createOnly: !duplicate,
+      profile: { name, config, scope: 'global', target: '' }
+    };
+    if (duplicate && Number.isFinite(duplicate.updatedAt)) message.expectedUpdatedAt = duplicate.updatedAt;
+
+    const response = await sendMessage(message);
+    if (!response || response.ok !== true) {
+      setProfilesNote(response && typeof response.error === 'string' && response.error
+        ? response.error
+        : 'That profile could not be saved.');
       return;
     }
+    const next = readProfiles(response.profiles);
     ui['profile-name'].value = '';
     renderProfiles(next);
-    setProfilesNote(duplicate ? `Updated the profile “${name}”.` : `Saved the profile “${name}”.`);
+    setProfilesNote(response.created ? `Saved the profile “${name}”.` : `Updated the profile “${name}”.`);
   }
 
   async function deleteProfile(profile, button) {
-    if (!env.hasStorage) {
+    if (!env.hasStorage || !env.live) {
       setProfilesNote(PREVIEW_NOTE);
       return;
     }
@@ -1032,14 +1034,16 @@ import { normalizeActions, DEFAULT_ACTIONS } from './actions-core.js';
       setProfilesNote(`Press Confirm delete to remove “${profile.name}”.`);
       return;
     }
-    const stored = await storageGet(['profiles']);
-    const next = readProfiles(stored.profiles).filter((item) => item.id !== profile.id);
-    const saved = await persistProfiles(next);
-    if (!saved) {
-      setProfilesNote('That profile could not be deleted.');
+    const message = { type: 'DELETE_PROFILE', id: profile.id };
+    if (Number.isFinite(profile.updatedAt)) message.expectedUpdatedAt = profile.updatedAt;
+    const response = await sendMessage(message);
+    if (!response || response.ok !== true) {
+      setProfilesNote(response && typeof response.error === 'string' && response.error
+        ? response.error
+        : 'That profile could not be deleted.');
       return;
     }
-    renderProfiles(next);
+    renderProfiles(readProfiles(response.profiles));
     setProfilesNote(`Deleted the profile “${profile.name}”.`);
   }
 
