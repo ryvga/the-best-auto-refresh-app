@@ -216,6 +216,8 @@
                 placeholder="// Return true to stop refreshing.&#10;const price = document.querySelector('.price');&#10;return price ? parseFloat(price.textContent) &lt; 100 : false;"></textarea>
       <p class="hint" id="hint-predicate-script">Runs in the page after every settle, with a read-only <code>context</code> of url, title, text, refreshCount, checkCount and settleSeconds. Return a truthy value to stop; anything else keeps refreshing. Errors and timeouts continue instead of stopping.</p>
       <p class="status-line" id="predicate-access" hidden></p>
+      <button class="btn btn-secondary btn-sm" type="button" id="predicate-grant" hidden
+              aria-describedby="hint-predicate-script">Grant JavaScript access for this website</button>
       <p class="field-error" id="err-predicate-script" hidden></p>
     </div>
 

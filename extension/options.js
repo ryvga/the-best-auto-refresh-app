@@ -152,7 +152,7 @@ import { MAX_PROFILE_NAME } from './profiles-store.js';
     'defaults-form', 'custom-panel', 'fixed-field', 'random-fields',
     'interval-seconds', 'min-seconds', 'max-seconds', 'stop-condition',
     'keyword-panel', 'keyword', 'selector-panel', 'selector',
-    'predicate-panel', 'predicate-script', 'predicate-access',
+    'predicate-panel', 'predicate-script', 'predicate-access', 'predicate-grant',
     'settle-seconds', 'max-refreshes', 'max-minutes', 'ignore-selector',
     'case-sensitive', 'whole-word', 'preserve-scroll', 'bypass-cache',
     'pause-when-hidden', 'pause-on-interaction', 'defaults-alert', 'defaults-note', 'save-defaults',
@@ -688,6 +688,7 @@ import { MAX_PROFILE_NAME } from './profiles-store.js';
     if (!node) return;
     if (!SCRIPT_CONDITIONS.has(condition)) {
       node.hidden = true;
+      if (ui['predicate-grant']) ui['predicate-grant'].hidden = true;
       return;
     }
     node.hidden = false;
@@ -701,10 +702,17 @@ import { MAX_PROFILE_NAME } from './profiles-store.js';
         granted = false;
       }
     }
+    // The dashboard has no page of its own to grant a hostname for, so it asks
+    // only for the optional userScripts permission. That is what makes the
+    // browser's own "Allow User Scripts" switch appear on the Details page;
+    // per-site access is still granted from the popup.
+    if (ui['predicate-grant']) {
+      ui['predicate-grant'].hidden = !(hasChrome && chrome.permissions && !granted);
+    }
     const text = !hasChrome || !chrome.permissions
       ? 'This browser build does not expose chrome.permissions, so JavaScript access cannot be checked here.'
       : !granted
-        ? 'JavaScript access is not granted yet. Enable it for a site from the popup, or Chrome keeps refreshing without stopping.'
+        ? 'JavaScript access is not granted yet. Press Grant JavaScript access, then allow it for a site from the popup; until then Chrome keeps refreshing without stopping.'
         : (!api || typeof api.execute !== 'function')
           ? 'Access is granted, but “Allow User Scripts” is off. Turn it on in this extension’s Details page, then reload the extension.'
           : 'JavaScript access is ready. The condition runs in the page after every settle.';
@@ -1325,6 +1333,34 @@ import { MAX_PROFILE_NAME } from './profiles-store.js';
     });
 
     ui['stop-condition'].addEventListener('change', syncConditionalPanels);
+    // Asked for from the panel that needs it. The request runs synchronously
+    // inside the click, so the click is the user gesture Chrome requires.
+    if (ui['predicate-grant']) {
+      ui['predicate-grant'].addEventListener('click', () => {
+        const node = ui['predicate-access'];
+        if (typeof chrome === 'undefined' || !chrome.permissions) {
+          if (node) node.textContent = 'This browser build does not expose chrome.permissions, so access cannot be requested here.';
+          return;
+        }
+        if (node) node.textContent = 'Waiting for your answer in the browser’s permission prompt…';
+        try {
+          chrome.permissions.request({ permissions: ['userScripts'] }, (granted) => {
+            const failed = chrome.runtime && chrome.runtime.lastError;
+            if (failed) {
+              if (node) node.textContent = failed.message || 'The permission request failed.';
+              return;
+            }
+            if (granted !== true) {
+              if (node) node.textContent = 'Access was not granted, so this condition never stops a refresh. You can try again at any time.';
+              return;
+            }
+            void refreshPredicateAccess(ui['stop-condition'] ? ui['stop-condition'].value : '');
+          });
+        } catch (error) {
+          if (node) node.textContent = 'The permission request failed.';
+        }
+      });
+    }
 
     ui['reset-defaults'].addEventListener('click', () => {
       applyConfigToForm(DEFAULT_CONFIG);

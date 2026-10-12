@@ -247,7 +247,7 @@ import { MAX_PROFILE_NAME, MAX_PROFILES } from './profiles-store.js';
     'controls', 'custom-panel', 'fixed-field', 'random-fields',
     'interval-seconds', 'min-seconds', 'max-seconds', 'stop-condition',
     'keyword-panel', 'keyword', 'selector-panel', 'selector', 'pick-element',
-    'predicate-panel', 'predicate-script', 'predicate-access',
+    'predicate-panel', 'predicate-script', 'predicate-access', 'predicate-grant',
     'advanced', 'settle-seconds', 'max-refreshes', 'max-minutes',
     'ignore-selector', 'case-sensitive', 'whole-word', 'preserve-scroll',
     'bypass-cache', 'pause-when-hidden', 'pause-on-interaction', 'form-alert', 'primary-action',
@@ -1669,6 +1669,52 @@ import { MAX_PROFILE_NAME, MAX_PROFILES } from './profiles-store.js';
   }
 
   /**
+   * Asks for the optional userScripts permission from the condition panel itself,
+   * so the feature that needs the grant is also the place that offers it. Like
+   * every other request in this popup it runs synchronously inside the click, so
+   * the click is the user gesture Chrome requires. The hostname is asked for at
+   * the same time because the condition has to execute in the page, not just be
+   * permitted in the abstract.
+   */
+  function grantPredicateAccess() {
+    const line = ui['predicate-access'];
+    if (!env.hasPermissions) {
+      setStatusLine(line, 'This browser build does not expose chrome.permissions, so access cannot be requested here.', 'is-error');
+      return;
+    }
+    let pattern = '';
+    try {
+      pattern = permissionOriginForUrl(activeTab && typeof activeTab.url === 'string' ? activeTab.url : '');
+    } catch (error) {
+      pattern = '';
+    }
+    if (typeof pattern !== 'string' || pattern === '') {
+      setStatusLine(line, 'Put a normal http or https page in front and press again. Browser pages, the Web Store and local files cannot be scripted.', 'is-error');
+      return;
+    }
+    setStatusLine(line, 'Waiting for your answer in the browser’s permission prompt…', '');
+    try {
+      chrome.permissions.request({ permissions: ['userScripts'], origins: [pattern] }, (granted) => {
+        const failed = chrome.runtime && chrome.runtime.lastError;
+        if (failed) {
+          setStatusLine(line, failed.message || 'The permission request failed.', 'is-error');
+          return;
+        }
+        if (granted !== true) {
+          setStatusLine(line, 'Access was not granted, so this condition never stops a refresh. You can try again at any time.', '');
+          return;
+        }
+        setFooterNote('JavaScript access granted for this website.');
+        // Re-reads the switch state too, so the message moves straight from
+        // "not granted" to the browser’s own "Allow User Scripts" instruction.
+        void refreshPredicateAccess(ui['stop-condition'] ? ui['stop-condition'].value : '');
+      });
+    } catch (error) {
+      setStatusLine(line, 'The permission request failed.', 'is-error');
+    }
+  }
+
+  /**
    * Say up front whether a custom condition can actually run here, instead of
    * letting every single check report the same blocked reason.
    */
@@ -1677,6 +1723,7 @@ import { MAX_PROFILE_NAME, MAX_PROFILES } from './profiles-store.js';
     if (!node) return;
     if (!SCRIPT_CONDITIONS.has(condition)) {
       node.hidden = true;
+      if (ui['predicate-grant']) ui['predicate-grant'].hidden = true;
       return;
     }
     node.hidden = false;
@@ -1689,6 +1736,13 @@ import { MAX_PROFILE_NAME, MAX_PROFILES } from './profiles-store.js';
       } catch {
         granted = false;
       }
+    }
+    // The condition panel is where the need appears, so it is also where the
+    // grant is offered. It is shown only while the grant is genuinely missing:
+    // once it is held, the remaining step is the browser's own "Allow User
+    // Scripts" switch, which no page is allowed to press for the user.
+    if (ui['predicate-grant']) {
+      ui['predicate-grant'].hidden = !(hasChrome && chrome.permissions && !granted);
     }
     if (!hasChrome || !chrome.permissions) {
       setStatusLine(node, 'This browser build does not expose chrome.permissions, so JavaScript access cannot be checked here.', 'is-error');
@@ -2871,6 +2925,11 @@ import { MAX_PROFILE_NAME, MAX_PROFILES } from './profiles-store.js';
       ui['automation-webhook-test'].addEventListener('click', sendTestNotification);
     }
     ui['automation-script-enable'].addEventListener('click', enableScriptOnSite);
+    // The condition panel offers the same grant its own feature needs, instead of
+    // sending the user into the automation section to find it.
+    if (ui['predicate-grant']) {
+      ui['predicate-grant'].addEventListener('click', grantPredicateAccess);
+    }
     ui['automation-script-example'].addEventListener('click', insertExampleSnippet);
     ui['automation-script-code'].addEventListener('input', updateCodeCount);
     ui['automation-manage-access'].addEventListener('click', openAutomationAccess);
@@ -2996,6 +3055,10 @@ import { MAX_PROFILE_NAME, MAX_PROFILES } from './profiles-store.js';
       ui['automation-webhook-connect'].title = 'Preview only — the extension engine is not reachable.';
       ui['automation-script-enable'].disabled = true;
       ui['automation-script-enable'].title = 'Preview only — the extension engine is not reachable.';
+      if (ui['predicate-grant']) {
+        ui['predicate-grant'].disabled = true;
+        ui['predicate-grant'].title = 'Preview only — a permission grant needs the extension engine.';
+      }
       // "Use ntfy settings" keeps working in preview because it only fills
       // fields; the one button that asks for a real request cannot work here.
       ui['automation-webhook-test'].disabled = true;

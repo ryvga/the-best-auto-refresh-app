@@ -1,5 +1,46 @@
 # Validation
 
+## Version 1.3.4 — the condition panel can ask for its own permission
+
+`userScripts` is declared as an optional permission so that people who never write a
+condition are not asked for it. That choice had a consequence nobody had checked:
+Chromium renders the **Allow User Scripts** switch on the extension's Details page
+*only once the extension already holds the grant*. With the permission unrequested,
+the row was not drawn at all, so the popup's status line told the user to switch on
+something that was not on the page. The only code path that requested the grant was
+the automation section's page-script button — a different feature, in a different
+part of the popup.
+
+Both condition panels now carry a grant button next to the status line, shown only
+while the grant is genuinely missing:
+
+- The popup asks for `userScripts` **and the current site's hostname**, because the
+  condition has to execute in the page after every settle. It reuses the same
+  `permissionOriginForUrl` guard as the other permission buttons: on a browser page,
+  the Web Store or a local file it explains why there is nothing to grant instead of
+  raising a request Chrome would reject.
+- The dashboard asks for `userScripts` alone. It has no page of its own to name, and
+  per-site access still comes from the popup.
+- Both requests run synchronously inside the click, before any `await`, so the click
+  is the user gesture Chrome requires. Neither one toggles the browser's own switch,
+  which no page is permitted to press; both explain that step instead.
+- Once the grant is held the button hides itself and the status line moves to the
+  "Allow User Scripts is off" instruction, then to "JavaScript access is ready".
+
+- 110 unit tests pass. The parity test now requires the button markup, the lookup,
+  and a `chrome.permissions.request({ permissions: ['userScripts'] … })` call in each
+  UI file, so a status line can no longer be shipped without a way to act on it.
+- The button is disabled with an explanatory title in the popup's preview mode, where
+  no extension engine is reachable.
+- Syntax, manifest and least-privilege validation pass. `manifest.json` and
+  `package.json` are at 1.3.4.
+
+Not verified in a real browser: that Helium and Chrome render the **Allow User
+Scripts** row immediately after the grant is accepted. The behaviour the button
+depends on — the row appearing only while the permission is held — was established by
+reading Chromium's own UI strings and the profile's granted-permission state, not by
+driving a browser.
+
 ## Version 1.3.3 — the custom condition actually reaches the engine, and profiles stop losing changes
 
 This release fixes a defect that made 1.3.2's headline feature unusable, and closes

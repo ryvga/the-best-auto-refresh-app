@@ -422,6 +422,17 @@ test('the popup and the dashboard both offer the custom condition end to end', (
     // validation id exactly or the message would have nowhere to land.
     assert.match(html, /id="err-predicate-script"/, `${name}.html needs the matching error node`);
     assert.match(html, /id="predicate-access"/, `${name}.html needs the access line`);
+    // The feature has to be able to ask for its own permission. userScripts is an
+    // optional permission, and Chromium does not render its "Allow User Scripts"
+    // switch at all until the extension holds the grant — so a status line that
+    // only described the problem left the user with nothing to click.
+    assert.match(html, /id="predicate-grant"/, `${name}.html needs a grant button`);
+    assert.match(js, /'predicate-grant'/, `${name}.js must look the grant button up`);
+    assert.match(
+      js,
+      /permissions\.request\(\{ permissions: \['userScripts'\]/,
+      `${name}.js must request userScripts from the condition panel`
+    );
 
     assert.match(js, /'script-predicate'/, `${name}.js must know the condition`);
     assert.match(js, /SCRIPT_CONDITIONS/, `${name}.js must gate the panel`);
