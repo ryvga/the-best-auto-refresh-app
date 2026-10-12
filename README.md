@@ -56,8 +56,6 @@ Store publication is a separate later step. See [store preparation](docs/STORE.m
 
 Every feature is free. If the extension saves you time, you can [support Mounir on Ko-fi](https://ko-fi.com/mouniryuga). Support is voluntary and unlocks no features. The extension embeds no payment scripts or tracking pixels; clicking the link opens the external Ko-fi site.
 
-See the [competitor and funding research](docs/RESEARCH.md) for product comparisons, Morocco payment options and the decision to keep ads out of monitored pages.
-
 ## License
 
 MIT. Contributions and reproducible bug reports are welcome. “The Best Auto Refresh App” is the product name, not a claim of an independently verified ranking.
