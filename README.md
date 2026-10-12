@@ -50,7 +50,9 @@ For real browser checks, install Playwright as a development tool and run `node 
 
 ## Publishing
 
-Store publication is a separate later step. See [store preparation](docs/STORE.md) for draft listing copy and permission explanations. Store acceptance is determined by Google review. The extension is free to users; Google may charge a developer registration fee.
+See the [Chrome Web Store submission guide](docs/SUBMISSION.md) for the full checklist, and [store preparation](docs/STORE.md) for the draft listing copy and permission explanations. The published privacy policy is at <https://ryvga.github.io/the-best-auto-refresh-app/PRIVACY.html>.
+
+Build the upload package with `powershell -ExecutionPolicy Bypass -File scripts/package.ps1`, then either upload it from the developer dashboard or automate it with `node scripts/publish-cws.mjs release` once the item exists and API credentials are configured. Store acceptance is determined by Google review. The extension is free to users; Google charges a one-time developer registration fee.
 
 ## Support development
 

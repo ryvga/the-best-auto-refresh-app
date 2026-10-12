@@ -2,6 +2,8 @@
 
 Status: development build; not submitted. Verify the release in current stable Chrome before submission.
 
+For the operational, step-by-step submission process — including developer registration, credentials, and automated releases — see [SUBMISSION.md](SUBMISSION.md). This page holds the listing copy and disclosure wording.
+
 ## Draft listing
 
 Name: The Best Auto Refresh App

@@ -1,0 +1,59 @@
+name: Publish to Chrome Web Store
+
+# The Chrome Web Store API can only update an item that already exists. Create
+# the item once in the developer dashboard before using this workflow.
+# See docs/SUBMISSION.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: What to do with the built package
+        type: choice
+        options:
+          - upload
+          - release
+          - release-staged
+        default: upload
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test
+        run: npm test
+
+      - name: Validate manifest
+        run: node scripts/validate-manifest.mjs
+
+      - name: Build store package
+        shell: pwsh
+        run: ./scripts/package.ps1
+
+      - name: Upload and publish
+        env:
+          CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+          CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+          CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+          CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
+          CWS_EXTENSION_ID: ${{ secrets.CWS_EXTENSION_ID }}
+          MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'release' }}
+        run: |
+          case "$MODE" in
+            upload)         node scripts/publish-cws.mjs upload ;;
+            release)        node scripts/publish-cws.mjs release ;;
+            release-staged) node scripts/publish-cws.mjs release --staged ;;
+            *) echo "unknown mode: $MODE"; exit 1 ;;
+          esac

@@ -10,6 +10,11 @@
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "test:watch": "node --test --watch tests/*.test.mjs"
+    "test:watch": "node --test --watch tests/*.test.mjs",
+    "cws:auth": "node scripts/cws-auth.mjs",
+    "cws:status": "node scripts/publish-cws.mjs status",
+    "cws:upload": "node scripts/publish-cws.mjs upload",
+    "cws:release": "node scripts/publish-cws.mjs release",
+    "cws:check": "node scripts/publish-cws.mjs upload --dry-run"
   }
 }
