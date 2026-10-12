@@ -15,7 +15,7 @@
  * Usage:
  *   node scripts/capture-store-assets.mjs [--out <dir>] [--browser <exe>] [--keep]
  *
- * Output: icon-128.png, four 1280x800 screenshots, a 440x280 promo tile,
+ * Output: icon-128.png, five 1280x800 screenshots, a 440x280 promo tile,
  * a 1400x560 marquee, and capture-report.json describing what was rendered.
  */
 
@@ -201,6 +201,13 @@ async function main() {
   await fs.cp(path.join(root, 'extension'), stage, { recursive: true });
   const manifest = JSON.parse((await fs.readFile(path.join(stage, 'manifest.json'), 'utf8')).replace(/^\uFEFF/, ''));
   manifest.host_permissions = ['http://127.0.0.1/*'];
+  // The custom JavaScript stop condition is optional in production, so it would
+  // photograph as "access not granted yet" on a machine that never enabled it.
+  // Promote the permission in the throwaway copy only, so one frame can show the
+  // panel in the state a user sees after opting in. The shipped manifest is
+  // untouched, and this deviation is recorded in the capture report.
+  manifest.permissions = [...new Set([...(manifest.permissions || []), 'userScripts'])];
+  manifest.optional_permissions = (manifest.optional_permissions || []).filter((name) => name !== 'userScripts');
   await fs.writeFile(path.join(stage, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
 
   let available = false;
@@ -307,7 +314,7 @@ async function main() {
      * the store frames are composed. Crispness comes from
      * --force-device-scale-factor=2 at launch.
      */
-    const capturePopup = async (file, { expand = [] } = {}) => {
+    const capturePopup = async (file, { expand = [], setup = '' } = {}) => {
       const session = await openPopup();
       // Sections such as Automation and Advanced start collapsed, so the frame
       // would otherwise repeat the settings above it.
@@ -322,11 +329,17 @@ async function main() {
         }, session);
         await sleep(900);
       }
+      // `setup` drives the form through its own events, so the captured frame is
+      // still the real UI reacting to real input rather than a styled mock.
+      if (setup) {
+        await cdp.send('Runtime.evaluate', { expression: setup }, session);
+        await sleep(900);
+      }
       const text = await evalJson(session, 'document.body.innerText');
       const geom = JSON.parse(await evalJson(session, `JSON.stringify({
         w: innerWidth,
         h: document.documentElement.scrollHeight,
-        sections: Object.fromEntries(['#session-heading','#profile-card','#interval-seconds','#stop-condition','#advanced','#automation','#primary-action','#stop-all']
+        sections: Object.fromEntries(['#session-heading','#profile-card','#interval-seconds','#stop-condition','#predicate-panel','#advanced','#automation','#primary-action','#stop-all']
           .map((s) => { const el = document.querySelector(s); return [s, el ? Math.round(el.getBoundingClientRect().top + scrollY) : null]; })),
         items: [...document.querySelectorAll('h1,h2,h3,label,button,legend,summary,p,strong')]
           .map((el) => { const r = el.getBoundingClientRect(); return { t: (el.innerText || '').trim().slice(0, 90), top: Math.round(r.top + scrollY), h: Math.round(r.height) }; })
@@ -361,6 +374,41 @@ async function main() {
     report.assets.push({ file: path.relative(outDir, dashShot), kind: 'dashboard',
       geometry: { w: 1280, h: 800 }, text: dashText });
 
+    // The custom JavaScript stop condition, chosen and filled in through the
+    // real form so its panel, hint, access line and code box are all genuine.
+    // The condition deliberately checks for an element the demo page does not
+    // have, so it keeps reporting "returned false" and the monitor stays running
+    // for the frame instead of stopping the session.
+    const predicateCode = [
+      "const price = document.querySelector('#price');",
+      'if (!price) return false;',
+      "const value = parseFloat(price.textContent.replace(/[^0-9.]/g, ''));",
+      'return Number.isFinite(value) && value < 100;',
+    ].join(String.fromCharCode(10));
+    // The keyword session above is still running; end it so START is accepted.
+    await controller.evaluate((m) => chrome.runtime.sendMessage(m), { type: 'STOP', tabId });
+    await sleep(800);
+    await controller.evaluate((m) => chrome.runtime.sendMessage(m), {
+      type: 'START', tabId,
+      config: {
+        intervalSeconds: 30,
+        stopCondition: 'script-predicate',
+        predicateScript: `const node = document.querySelector('#price');\nif (!node) return false;\nconst value = parseFloat(node.textContent.replace(/[^0-9.]/g, ''));\nreturn Number.isFinite(value) && value < 100;`,
+      },
+    });
+    await sleep(2600);
+    const predicateSetup = `(() => {
+      const select = document.getElementById('stop-condition');
+      if (select) { select.value = 'script-predicate'; select.dispatchEvent(new Event('change', { bubbles: true })); }
+      const code = document.getElementById('predicate-script');
+      if (code) {
+        code.value = ${JSON.stringify(predicateCode)};
+        code.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+      return true;
+    })()`;
+    const predicatePopup = await capturePopup('popup-predicate.png', { setup: predicateSetup });
+
     // --- compose store-ready frames ---------------------------------------
     const img = (p) => `${assetBase}/${path.relative(outDir, p).split(path.sep).join('/')}`;
     const compose = async (name, html, width, height) => {
@@ -389,6 +437,17 @@ async function main() {
       automation: crop(at('#automation', 900) - 24),
     };
 
+    // The custom condition lives on its own popup surface, so it gets its own
+    // crop window rather than a window onto the first capture.
+    const crop2 = (y) => Math.max(0, Math.min(predicatePopup.h - POPUP_H, Math.round(y)));
+    const shot2 = (extra) => ({
+      popupWidth: predicatePopup.w, popupHeight: POPUP_H, imageUrl: img(predicatePopup.dest), ...extra,
+    });
+    const at2 = (selector, fallback) => predicatePopup.sections[selector] ?? fallback;
+    const visibleIn2 = (y) => [...new Set(predicatePopup.items
+      .filter((i) => i.top + i.h > y && i.top < y + POPUP_H).map((i) => i.t))];
+    const crops2 = { customCondition: crop2(at2('#predicate-panel', at2('#stop-condition', 420)) - 150) };
+
     await compose('screenshot-1-popup-running', frameHtml({
       eyebrow: 'Refresh on your schedule',
       headline: 'Set it, then stop<br>watching the clock',
@@ -412,6 +471,13 @@ async function main() {
 
     // Dashboard fills the frame natively, so it is used full-bleed.
     await fs.copyFile(dashShot, path.join(outDir, 'screenshot-4-dashboard.png'));
+
+    await compose('screenshot-5-custom-condition', frameHtml({
+      eyebrow: 'Anything the presets miss',
+      headline: 'Describe the finish line<br>in your own code',
+      bullets: ['Your JavaScript runs after every settle', 'A truthy result stops; anything else keeps refreshing', 'Errors and timeouts never end the run'],
+      ...shot2({ cropY: crops2.customCondition }),
+    }), 1280, 800);
 
     const iconDest = path.join(outDir, 'icon-128.png');
     await fs.copyFile(path.join(root, 'extension', 'icons', 'icon128.png'), iconDest);
@@ -443,10 +509,11 @@ async function main() {
     };
 
     const finals = ['screenshot-1-popup-running', 'screenshot-2-stop-conditions', 'screenshot-3-automation',
-      'screenshot-4-dashboard', 'promo-small-440x280', 'promo-marquee-1400x560'];
+      'screenshot-4-dashboard', 'screenshot-5-custom-condition', 'promo-small-440x280', 'promo-marquee-1400x560'];
     const expected = {
       'screenshot-1-popup-running': [1280, 800], 'screenshot-2-stop-conditions': [1280, 800],
       'screenshot-3-automation': [1280, 800], 'screenshot-4-dashboard': [1280, 800],
+      'screenshot-5-custom-condition': [1280, 800],
       'promo-small-440x280': [440, 280], 'promo-marquee-1400x560': [1400, 560],
     };
     const verification = [];
@@ -471,11 +538,14 @@ async function main() {
       'screenshot-1-popup-running': visibleIn(crops.top),
       'screenshot-2-stop-conditions': visibleIn(crops.stopConditions),
       'screenshot-3-automation': visibleIn(crops.automation),
+      'screenshot-5-custom-condition': visibleIn2(crops2.customCondition),
     };
     report.iconSource = 'extension/icons/icon128.png (unmodified copy)';
     report.note = 'Popup and dashboard pixels are the real extension UI driven against a local demo page. '
-      + 'A throwaway copy added host_permissions for 127.0.0.1 only so monitoring could start without a click. '
-      + 'Popup crops are windows onto one full-surface capture, because headless refuses to size the popup window. '
+      + 'A throwaway copy added host_permissions for 127.0.0.1 only so monitoring could start without a click, '
+      + 'and promoted the optional userScripts permission to required so the custom-condition panel could be '
+      + 'photographed in its granted state; the shipped manifest keeps userScripts optional. '
+      + 'Popup crops are windows onto full-surface captures, because headless refuses to size the popup window. '
       + 'Only the promo tiles, screenshot backgrounds and captions are composed artwork.';
     await fs.writeFile(path.join(outDir, 'capture-report.json'), JSON.stringify(report, null, 2), 'utf8');
 
