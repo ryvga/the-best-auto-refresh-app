@@ -80,6 +80,22 @@
 
   const PRESET_VALUES = ['10', '30', '60'];
 
+  // Per-tab drafts. Each tab id gets its own key in chrome.storage.session, so
+  // one window's unfinished edits never leak into another tab, and drafts vanish
+  // when the browser closes. Values are kept exactly as typed: raw strings,
+  // radio choices, checkbox states and the Advanced disclosure state.
+  const DRAFT_VERSION = 1;
+  const DRAFT_KEY_PREFIX = 'popupDraft:';
+  const DRAFT_TEXT_FIELDS = [
+    'interval-seconds', 'min-seconds', 'max-seconds', 'settle-seconds',
+    'max-refreshes', 'max-minutes', 'keyword', 'selector', 'ignore-selector'
+  ];
+  const DRAFT_CHECK_FIELDS = [
+    'case-sensitive', 'whole-word', 'preserve-scroll', 'bypass-cache', 'pause-when-hidden'
+  ];
+  const DRAFT_PRESET_SET = new Set(PRESET_VALUES.concat('custom'));
+  const DRAFT_MODE_SET = new Set(['fixed', 'random']);
+
   // ------------------------------------------------------------ environment
 
   const env = (() => {
@@ -92,6 +108,11 @@
       extensionId,
       hasTabs: hasChrome && !!chrome.tabs && typeof chrome.tabs.query === 'function',
       hasStorage: hasChrome && !!chrome.storage && !!chrome.storage.local,
+      // Trusted extension context only; drafts live and die with the browser session.
+      hasSessionStorage: hasChrome && !!chrome.storage && !!chrome.storage.session
+        && typeof chrome.storage.session.get === 'function'
+        && typeof chrome.storage.session.set === 'function'
+        && typeof chrome.storage.session.remove === 'function',
       hasTabsCreate: hasChrome && !!chrome.tabs && typeof chrome.tabs.create === 'function',
       hasOpenOptions:
         hasRuntime && typeof chrome.runtime.openOptionsPage === 'function',
@@ -122,6 +143,7 @@
   // ------------------------------------------------------------------ state
 
   const memoryStore = Object.create(null);
+  const sessionMemoryStore = Object.create(null);
   let activeTab = null;
   let pageRestricted = false;
   let currentState = idleState();
@@ -130,6 +152,11 @@
   let noteTimer = null;
   let inFlight = false;
   let busy = false;
+  // formDirty records real user input so a late draft/default render can never
+  // clobber it; draftWriteChain tracks dispatched writes before a draft is cleared.
+  let formDirty = false;
+  let restoringForm = false;
+  let draftWriteChain = Promise.resolve();
 
   // ------------------------------------------------------------ small utils
 
@@ -335,6 +362,188 @@
         resolve(false);
       }
     });
+  }
+
+  function storageRemove(keys) {
+    return new Promise((resolve) => {
+      if (!env.hasStorage) {
+        keys.forEach((key) => { delete memoryStore[key]; });
+        resolve(true);
+        return;
+      }
+      try {
+        chrome.storage.local.remove(keys, () => {
+          const failed = chrome.runtime && chrome.runtime.lastError;
+          resolve(!failed);
+        });
+      } catch (error) {
+        resolve(false);
+      }
+    });
+  }
+
+  // ------------------------------------------------------------ session drafts
+
+  function draftKey(tabId) { return `${DRAFT_KEY_PREFIX}${tabId}`; }
+
+  function sessionGet(keys) {
+    return new Promise((resolve) => {
+      if (!env.hasSessionStorage) {
+        const result = {};
+        keys.forEach((key) => { if (key in sessionMemoryStore) result[key] = sessionMemoryStore[key]; });
+        resolve(result);
+        return;
+      }
+      try {
+        chrome.storage.session.get(keys, (items) => {
+          if (chrome.runtime && chrome.runtime.lastError) {
+            resolve({});
+            return;
+          }
+          resolve(items && typeof items === 'object' ? items : {});
+        });
+      } catch (error) {
+        resolve({});
+      }
+    });
+  }
+
+  function sessionSet(items) {
+    return new Promise((resolve) => {
+      if (!env.hasSessionStorage) {
+        Object.assign(sessionMemoryStore, items);
+        resolve(true);
+        return;
+      }
+      try {
+        chrome.storage.session.set(items, () => {
+          const failed = chrome.runtime && chrome.runtime.lastError;
+          resolve(!failed);
+        });
+      } catch (error) {
+        resolve(false);
+      }
+    });
+  }
+
+  function sessionRemove(keys) {
+    return new Promise((resolve) => {
+      if (!env.hasSessionStorage) {
+        keys.forEach((key) => { delete sessionMemoryStore[key]; });
+        resolve(true);
+        return;
+      }
+      try {
+        chrome.storage.session.remove(keys, () => {
+          const failed = chrome.runtime && chrome.runtime.lastError;
+          resolve(!failed);
+        });
+      } catch (error) {
+        resolve(false);
+      }
+    });
+  }
+
+  /** Snapshot of everything the user can change, kept raw (no trim, no clamp). */
+  function readDraftFromForm() {
+    const values = {};
+    DRAFT_TEXT_FIELDS.forEach((fieldId) => {
+      const input = el(fieldId);
+      if (input) values[fieldId] = input.value;
+    });
+    const checks = {};
+    DRAFT_CHECK_FIELDS.forEach((fieldId) => {
+      const input = el(fieldId);
+      if (input) checks[fieldId] = input.checked;
+    });
+    return {
+      v: DRAFT_VERSION,
+      preset: checkedValue('intervalPreset'),
+      mode: checkedValue('intervalMode'),
+      stopCondition: ui['stop-condition'] ? ui['stop-condition'].value : null,
+      values,
+      checks,
+      advancedOpen: !!(ui.advanced && ui.advanced.open)
+    };
+  }
+
+  /** Puts a stored draft back exactly as it was, including unfinished values. */
+  function applyDraftToForm(draft) {
+    if (!draft || typeof draft !== 'object') return false;
+    const values = draft.values && typeof draft.values === 'object' ? draft.values : {};
+    DRAFT_TEXT_FIELDS.forEach((fieldId) => {
+      const input = el(fieldId);
+      if (input && typeof values[fieldId] === 'string') input.value = values[fieldId];
+    });
+
+    const checks = draft.checks && typeof draft.checks === 'object' ? draft.checks : {};
+    DRAFT_CHECK_FIELDS.forEach((fieldId) => {
+      const input = el(fieldId);
+      if (input && typeof checks[fieldId] === 'boolean') input.checked = checks[fieldId];
+    });
+
+    if (typeof draft.preset === 'string' && DRAFT_PRESET_SET.has(draft.preset)) {
+      setChecked('intervalPreset', draft.preset);
+    }
+    if (typeof draft.mode === 'string' && DRAFT_MODE_SET.has(draft.mode)) {
+      setChecked('intervalMode', draft.mode);
+    }
+    if (typeof draft.stopCondition === 'string' && STOP_CONDITION_SET.has(draft.stopCondition)) {
+      ui['stop-condition'].value = draft.stopCondition;
+    }
+    if (ui.advanced) ui.advanced.open = draft.advancedOpen === true;
+
+    syncConditionalPanels();
+    return true;
+  }
+
+  /**
+   * Writes the whole form for the active tab immediately. Defaults are never
+   * touched here; only Start and Save as default change saved defaults.
+   */
+  function persistDraft() {
+    if (!activeTab || typeof activeTab.id !== 'number') return Promise.resolve(false);
+    const tabId = activeTab.id;
+    const draft = readDraftFromForm();
+    draft.tabId = tabId;
+    draft.updatedAt = Date.now();
+    const items = { [draftKey(tabId)]: draft };
+    // Dispatch every update in its input event. Waiting for an earlier callback
+    // would leave newer edits in this popup's memory when the popup is destroyed.
+    const write = sessionSet(items);
+    draftWriteChain = Promise.all([draftWriteChain, write]).then(() => undefined);
+    return write;
+  }
+
+  /** Drops this tab's draft after a successful Start or Save as default. */
+  async function clearDraft() {
+    if (!activeTab || typeof activeTab.id !== 'number') return Promise.resolve(false);
+    const key = draftKey(activeTab.id);
+    await draftWriteChain;
+    return sessionRemove([key]);
+  }
+
+  /** Restores this tab's draft, if any. Runs after defaults and activeTab resolve. */
+  async function restoreDraft() {
+    if (!activeTab || typeof activeTab.id !== 'number') return false;
+    const key = draftKey(activeTab.id);
+    const items = await sessionGet([key]);
+    if (formDirty) return false;
+    const draft = items[key];
+    if (!draft || typeof draft !== 'object') return false;
+    restoringForm = true;
+    try {
+      applyDraftToForm(draft);
+    } finally {
+      restoringForm = false;
+    }
+    return true;
+  }
+
+  function handleFormEdit() {
+    formDirty = true;
+    if (restoringForm) return;
+    persistDraft();
   }
 
   // ------------------------------------------------------------------ render
@@ -848,6 +1057,7 @@
     }
     applyState(result.state || Object.assign(idleState(), { status: 'running', config, startedAt: Date.now() }));
     const saved = await storageSet({ defaults: config });
+    await clearDraft();
     setFooterNote(saved ? 'Refreshing and saved as your default settings.' : 'Refreshing. Defaults could not be saved.');
   }
 
@@ -884,6 +1094,7 @@
       return;
     }
     const saved = await storageSet({ defaults: config });
+    if (saved) await clearDraft();
     setFooterNote(saved ? 'Saved as your default settings.' : 'Defaults could not be saved.');
   }
 
@@ -897,6 +1108,8 @@
       setStateMessage('The element picker cannot run on this page. Open a normal website tab and try again.', 'is-warn');
       return;
     }
+    // Persist the unfinished form before the picker takes over and this popup closes.
+    await persistDraft();
     setBusy(true);
     const result = unwrap(await sendMessage({ type: 'PICK_ELEMENT', tabId: activeTab.id }));
     setBusy(false);
@@ -910,27 +1123,42 @@
 
   // ----------------------------------------------------------- picked element
 
-  function applyPickedSelector(picked, source) {
+  async function applyPickedSelector(picked, source) {
     if (!picked || typeof picked.selector !== 'string' || picked.selector.trim() === '') return false;
     if (!activeTab || picked.tabId !== activeTab.id) return false;
-    // When the popup opens, a selector already loaded from saved defaults wins.
-    if (source === 'startup' && ui.selector.value.trim() !== '') return false;
 
+    // A fresh pick always wins over a restored draft or a saved default, and the
+    // draft is refreshed so reopening the popup keeps showing the picked selector.
     ui.selector.value = picked.selector.trim();
     syncConditionalPanels();
 
     if (!SELECTOR_CONDITIONS.has(ui['stop-condition'].value)) {
       setFooterNote('Element picked. Choose a stop condition that watches an element to use it.');
     }
-    // Picking finishes on the page, so step out of the way once the selector lands.
+    // Flush the refreshed draft before the picker hands control back, and only
+    // then step out of the way once the selector has landed.
+    await persistDraft();
     if (source === 'change' && !document.hidden) window.close();
     return true;
+  }
+
+  /** Applies a pick and then clears it, so a stored selector is always single-use. */
+  async function consumePickedSelector(picked, source) {
+    const applied = await applyPickedSelector(picked, source);
+    if (picked && activeTab && picked.tabId === activeTab.id) {
+      await storageRemove(['pickedSelector']);
+    }
+    return applied;
   }
 
   async function consumeStoredPickedSelector() {
     if (!env.hasStorage || !activeTab || typeof activeTab.id !== 'number') return;
     const items = await storageGet(['pickedSelector']);
-    if (items.pickedSelector) applyPickedSelector(items.pickedSelector, 'startup');
+    const picked = items.pickedSelector;
+    // Only this tab's pending pick is read, and it is consumed immediately, so a
+    // stored selector can never override later edits.
+    if (!picked || typeof picked !== 'object' || picked.tabId !== activeTab.id) return;
+    await consumePickedSelector(picked, 'startup');
   }
 
   // ------------------------------------------------------------------ events
@@ -993,6 +1221,13 @@
 
     ui['stop-condition'].addEventListener('change', syncConditionalPanels);
 
+    // Every keystroke, radio/checkbox change and Advanced toggle is written to
+    // this tab's draft straight away. Registered after the handlers above so the
+    // snapshot always reflects their side effects (for example preset timing).
+    ui.controls.addEventListener('input', handleFormEdit);
+    ui.controls.addEventListener('change', handleFormEdit);
+    if (ui.advanced) ui.advanced.addEventListener('toggle', handleFormEdit);
+
     VALIDATED_FIELDS.forEach((fieldId) => {
       const input = el(fieldId);
       if (!input) return;
@@ -1027,7 +1262,9 @@
     if (env.hasStorage && chrome.storage.onChanged && typeof chrome.storage.onChanged.addListener === 'function') {
       chrome.storage.onChanged.addListener((changes, area) => {
         if (area !== 'local' || !changes.pickedSelector) return;
-        applyPickedSelector(changes.pickedSelector.newValue, 'change');
+        const picked = changes.pickedSelector.newValue;
+        if (!picked) return;
+        consumePickedSelector(picked, 'change');
       });
     }
   }
@@ -1064,7 +1301,8 @@
 
     const stored = await storageGet(['defaults']);
     lastKnownConfig = normalizeConfig(stored.defaults);
-    applyConfigToForm(lastKnownConfig);
+    // If the user already typed while storage was loading, their input wins.
+    if (!formDirty) applyConfigToForm(lastKnownConfig);
 
     activeTab = await queryActiveTab();
     pageRestricted = !!(activeTab && isRestrictedUrl(activeTab.url));
@@ -1077,6 +1315,11 @@
       applyState(null);
       setStateMessage('Preview only — nothing is refreshed and nothing is sent. Install and reload the extension to use these controls.', 'is-warn');
     } else {
+      // Restore this tab's unfinished draft after defaults and activeTab resolve.
+      // A pending picked selector is consumed last so the fresh pick wins, and
+      // refreshState polling below only ever repaints the session card.
+      if (formDirty) await persistDraft();
+      else await restoreDraft();
       await consumeStoredPickedSelector();
       await refreshState();
     }

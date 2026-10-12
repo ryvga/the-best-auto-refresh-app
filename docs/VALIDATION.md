@@ -1,5 +1,13 @@
 # Validation — version 1.0.0
 
+## Version 1.0.1 — popup drafts
+
+Added per-tab temporary drafts so unfinished settings survive popup dismissal without saving defaults. Eleven real MV3 popup checks pass, including immediate close after 20 synchronous input events, raw incomplete fields, Advanced state, independent tabs, defaults remaining separate, successful Save/Start clearing stale drafts, and picker return replacing the selector while retaining settings. The 45 engine tests and manifest/syntax checks also pass. No permissions or external endpoints were added.
+
+A bailian-tpp DeepSeek V4.1 Flash worker supplied the popup changes; the orchestrator completed the rapid-close dispatch fix and integration after stopping the worker's extended verification. Native GPT-6 Luna supplied the regression script and independently reproduced the queued-write loss before the final fix.
+
+## Initial release checks
+
 Validated on October 12, 2026 using Node.js 25 and the installed Helium executable.
 
 - 45 engine unit tests passed, including matching, configuration bounds, schedule decisions, message authorization, selectors, origins and packaging.

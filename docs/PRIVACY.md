@@ -6,7 +6,7 @@ The Best Auto Refresh App runs locally in your browser. It does not collect or t
 
 ## Local data
 
-The extension stores your settings and saved profiles in the browser's local extension storage. Active monitoring sessions store the tab identifier, URL/title, monitoring rules, normalized page text needed for comparison, timing, and results in browser session storage. These sessions are cleared when the browser session ends. Local saved settings remain until removed or the extension is uninstalled. Do not put secrets in saved keyword profiles on shared devices.
+The extension stores your settings and saved profiles in the browser's local extension storage. Unfinished popup settings, including any typed keywords and selectors, are saved per tab in temporary browser session storage so closing the popup does not discard your work. Active monitoring sessions also store the tab identifier, URL/title, monitoring rules, normalized page text needed for comparison, timing, and results in browser session storage. Temporary drafts and sessions are cleared when the browser session ends. Local saved settings remain until removed or the extension is uninstalled. Do not put secrets in saved keyword profiles on shared devices.
 
 ## Permissions
 

@@ -12,6 +12,7 @@ No account. No ads. No paywalls. No analytics. All monitoring happens on your de
 - Point-and-click element picker; ignore noisy areas with a CSS selector.
 - Set a maximum refresh count or duration, pause/resume, preserve scroll, or bypass the cache.
 - Saved profiles and a dashboard for monitored tabs.
+- Unfinished popup settings are remembered per tab during the browser session, so you can close the popup to copy a keyword and continue where you left off.
 - Explicit per-tab access using `activeTab`, with no all-websites permission request.
 
 ## Install locally in Chrome or Helium
